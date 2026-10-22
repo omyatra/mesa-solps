@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mesa_solps"]
+
+
+[project]
+name = "mesa-solps"
+version = "0.1.0.dev0"
+authors = [
+    {name = "Chris Bowman", email = "chris.bowman.physics@gmail.com"},
+]
+description = "SOLPS-ITER plug-in for the MESA optimisation framework"
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+# mesa itself requires Python >= 3.10
+requires-python = ">=3.10"
+dependencies = [
+    "numpy >= 1.20",
+    "scipy >= 1.6.3",
+    # mesa and sim-solps are pinned to commits on forks: mesa has no tags and
+    # upstream lacks a `version` in its pyproject.toml, and the latest
+    # sim-solps tag (0.1.3) predates the `Instrument` base-class.
+    "mesa @ git+https://github.com/omyatra/mesa.git@468c754eeb1b4718c3336bd5b436c11f332a8a72",
+    "sim-solps @ git+https://github.com/omyatra/sim-solps.git@7a8d1ac47a8d6bd82af8e89fa6390ed8baad179c",
+]
+
+[project.urls]
+Homepage = "https://github.com/C-bowman/mesa-solps"
