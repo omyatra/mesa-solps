@@ -10,7 +10,7 @@ from numpy import log, polyfit, searchsorted
 
 from sims.interface import SolpsInterface
 from mesa.simulations import RunStatus, Simulation, SimulationRun
-from .transport import write_solps_transport_inputfile
+from .transport import check_transport_template, write_solps_transport_inputfile
 from .models import linear_transport_profile, profile_radius_axis
 from .parameters import conductivity_profile, diffusivity_profile, required_parameters
 
@@ -85,7 +85,6 @@ class Solps(Simulation):
         self,
         reference_directory: Path,
         transport_profile_bounds: tuple[float, float],
-        set_div_transport: bool = False,
         n_proc: int = 1,
         memory_gb: int = 20,
         timeout_hours: int = 24,
@@ -93,7 +92,9 @@ class Solps(Simulation):
         # absolute, so it doesn't depend on the current directory
         self.reference_directory = Path(reference_directory).resolve()
         self.transport_bounds = transport_profile_bounds
-        self.set_div_transport = set_div_transport
+        # stop now, before anything is submitted, if the reference
+        # b2.transport.inputfile can't be used as a template
+        check_transport_template(self.reference_directory / "b2.transport.inputfile")
         self.n_proc = n_proc
         self.memory = memory_gb
         self.timeout_hours = timeout_hours
@@ -132,6 +133,7 @@ class Solps(Simulation):
         D = linear_transport_profile(D_radius, D_params, self.transport_bounds)
 
         write_solps_transport_inputfile(
+            template=self.reference_directory / 'b2.transport.inputfile',
             filename=case_dir / 'b2.transport.inputfile',
             grid_dperp=D_radius,
             values_dperp=D,
@@ -139,9 +141,6 @@ class Solps(Simulation):
             values_chieperp=chi,
             grid_chiiperp=chi_radius,
             values_chiiperp=chi,
-            set_ana_visc_dperp=False,  # TODO - may need to be chosen via settings file
-            no_pflux=True,
-            no_div=self.set_div_transport
         )
 
         # SOLPS has to start inside the run directory (it finds ../baserun from

@@ -37,7 +37,6 @@ simulation = Solps(
     n_proc=36,
     memory_gb=20,
     timeout_hours=24,
-    set_div_transport=True,
     transport_profile_bounds=(-0.250, 0.240),
     reference_directory=simulations_directory / "ref_clean"
 )
