@@ -46,7 +46,7 @@ class SolpsRun(SimulationRun):
             status = "complete" if balance_created else "crashed"
         elif (time() - self.launch_time) > self.timeout_hours * 3600.:
             status = "timed-out"
-        elif check_convergence(minimum_run_time=1e-3, window=2e-4):
+        elif check_convergence(self.directory, minimum_run_time=1e-3, window=2e-4):
             quit_file = self.directory / "b2mn.exe.dir/.quit"
             if not isfile(quit_file):
                 subprocess.run(["touch", quit_file], encoding="utf-8")
@@ -90,7 +90,8 @@ class Solps(Simulation):
         memory_gb: int = 20,
         timeout_hours: int = 24,
     ):
-        self.reference_directory = reference_directory
+        # absolute, so it doesn't depend on the current directory
+        self.reference_directory = Path(reference_directory).resolve()
         self.transport_bounds = transport_profile_bounds
         self.set_div_transport = set_div_transport
         self.n_proc = n_proc
@@ -113,7 +114,7 @@ class Solps(Simulation):
         :param str simulations_directory: \
 
         """
-        case_dir = simulations_directory / f"run_{run_number}"
+        case_dir = Path(simulations_directory).resolve() / f"run_{run_number}"
 
         build_solps_case(
             reference_directory=self.reference_directory,
@@ -143,14 +144,12 @@ class Solps(Simulation):
             no_div=self.set_div_transport
         )
 
-        # Go to the SOLPS run directory to prepare execution
-        os.chdir(case_dir)
-
+        # SOLPS has to start inside the run directory (it finds ../baserun from
+        # there), but the driver itself never changes directory.
         command = "itmsubmit" if self.n_proc == 1 else f'itmsubmit -m "-np {self.n_proc}" -M {self.memory}GB'
-        start_run = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+        start_run = subprocess.run(command, stdout=subprocess.PIPE, shell=True, cwd=case_dir)
 
-        start_run_output = start_run.communicate()[0]
-        os.chdir(simulations_directory)
+        start_run_output = start_run.stdout
         # Find the batch job number
         findstr = 'Submitted batch job'
         tmp = str(start_run_output).find(findstr)
@@ -235,11 +234,24 @@ def build_solps_case(
             )
 
 
-def check_convergence(minimum_run_time: float, window: float) -> bool:
-    with netcdf.netcdf_file("./b2time.nc", "r") as solps:
-        ne = solps.variables["ne3da"].data.copy()
-        te = solps.variables["te3da"].data.copy() / 1.602e-19
-        time = solps.variables["timesa"].data.copy()
+def check_convergence(run_directory: Path, minimum_run_time: float, window: float) -> bool:
+    # A fresh run writes b2time.nc in b2mn.exe.dir while it runs; a restarted
+    # run appends to the one in the run directory.
+    time_file = run_directory / "b2mn.exe.dir" / "b2time.nc"
+    if not isfile(time_file):
+        time_file = run_directory / "b2time.nc"
+    if not isfile(time_file):
+        return False
+
+    try:
+        with netcdf.netcdf_file(time_file, "r") as solps:
+            ne = solps.variables["ne3da"].data.copy()
+            te = solps.variables["te3da"].data.copy() / 1.602e-19
+            time = solps.variables["timesa"].data.copy()
+    except Exception as error:
+        # e.g. the file is read while SOLPS is writing it; try again next poll
+        logging.info(f"[solps_interface] could not read {time_file}: {error!r}")
+        return False
 
     assert minimum_run_time > window
     run_time = time.max() - time.min()
