@@ -1,19 +1,21 @@
 # Handoff: mesa-solps
 
-## Current state: driver fixes, series A done
+## Current state: driver fixes, series A and B done
 
 Fixes to the SOLPS driver are being made from a commit plan kept outside this repo, as series of
 commits labelled A1, A2, ... (A: launching runs, B: polling, C: failures and results, D: logging,
-heartbeat and resume). **Series A (A1–A5) is done. Series B (B1–B7) is next.** Each commit
-message's "Tested:" section is still empty: it is filled in after the tests on the cluster.
+heartbeat and resume). **Series A (A1–A5) and B (B1–B7) are done. Series C (C1–C4) is next.**
+Each commit message's "Tested:" section is still empty: it is filled in after the tests on the
+cluster.
 
 Branches (local, not pushed):
 
 - mesa-solps: `worktree-mesa-ab`
-- mesa: `mesa-ab` (one commit, needed by A4)
+- mesa: `mesa-ab` (three commits: one needed by A4, then B6 and B7)
 
-**mesa-solps now needs the mesa commit below.** From A4 on, `Solps.launch()` takes `iteration`,
-which only mesa `d484c39` passes. The `pyproject.toml` pin still points at `468c754`, so
+**mesa-solps needs mesa from the `mesa-ab` branch.** From A4 on, `Solps.launch()` takes
+`iteration`, which only mesa `d484c39` and later pass. B6 (poll interval) and B7 (error handling)
+are engine changes the driver needs too. The `pyproject.toml` pin still points at `468c754`, so
 `pip install .` alone installs a mesa that doesn't pass `iteration`, and the first launch fails
 with a TypeError (before anything is created or submitted). Until the pin moves (the last commit
 of the plan, after the mesa commits are pushed), install mesa from the `mesa-ab` branch as an
@@ -35,6 +37,13 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | –     | mesa | `d484c39` | `Simulation.launch()` gets `iteration` (the engine passes it) and `**kwargs`, with a docstring rule: the engine passes every argument by keyword, and plug-ins should accept `**kwargs`. Himmelblau example updated. |
 | A4    | mesa-solps | `0b992b4` | `run_N/run_info.json`, written after `itmsubmit` via a tmp file + `os.replace`: `run_number`, `iteration`, `parameters`, and `jobs` (one entry per submit: `job_id`, `submit_time` as local ISO time with UTC offset). `Solps.launch()` takes `iteration` and `**kwargs`. |
 | A5    | mesa-solps | `be2b995` | `build_solps_case` copy list: adds `b2.user.parameters`, drops `fort.1` and `fort.13` (no `fort.*` files are copied from the reference). |
+| B1    | mesa-solps | `96ce9b8` | `status()` matches the job ID exactly: `squeue -h -u <user> -o %i`, parsed into a set (was a substring search of the whole table). |
+| B2    | mesa-solps | `5d8390f` | The 24 h run timeout is removed: no `"timed-out"` from `status()`, no `timeout_hours` in `Solps`, `SolpsRun` or `example_input.py`. Run length is left to SOLPS's own clean stop in `b2mn.dat`. |
+| B3    | mesa-solps | `55508cc` | `Solps` settings `convergence_min_run_time` (1e-3 s), `convergence_window` (2e-4 s), `convergence_timescale` (1.0 s), passed via each `SolpsRun` to `check_convergence`. Window ≥ minimum run time is a `ValueError` at start-up (in `Solps.__init__`), replacing the assert. |
+| B4    | mesa-solps | `ee6a4d4` | Per-run Slurm states. One `squeue -h -u <user> -o "%i %T %r"` call per status check; a failing call keeps the run "running". PENDING: no checks, needs-attention log after 24 h. RUNNING: convergence test (`.quit`), needs-attention log after 1 h with no `b2time.nc`. COMPLETING: wait, log after 30 min. Other states: wait. Not listed: `sacct -j <id> -n -X -o State%30`; a finished state means ended, anything else or a failing `sacct` means still running, unknown to both for 3 polls is logged. Ended: no `balance.nc`, or `b2fstate_OK_bool` (run in `run_N/`) non-zero, means crashed; else complete. State changes are logged, and `started` / `ended` are added to the job's entry in `run_info.json`. Needs-attention lines are logged once per state. |
+| B5    | mesa-solps | `27d4b18` | At the end of a healthy job: converged → complete; `b2time.nc` missing or unreadable → crashed (`check_convergence` returns `None` for "can't judge"); not converged → continued in `run_N/` (`b2fstati` → `b2fstati<k>`, `b2fstate` → `b2fstati`, `balance.nc` → `balance<k>.nc`, `b2mn.prt` removed, resubmitted, job appended to `run_info.json`). After `max_continuations` (new `Solps` setting, default 10, counted from `run_info.json`) the run is logged as stalled and returned as complete. `submit_job()` is shared by `launch()` and continuations. `SolpsRun`'s hash no longer includes the job ID. |
+| B6    | mesa | `2c5d1ba` | `launch_iteration`: each pass checks statuses, then fills free slots, then sleeps `poll_interval` (new setting, default 1800 s; no sleep after the iteration's last run). `poll_interval` is a `Mesa` argument and an optional input-file variable (`parse_input_module` only requires fields without a default). |
+| B7    | mesa | `df8d08b` | Error handling. `status()` raising: warning, run treated as running; after 3 in a row, "status check failing, needs attention". Scoring raising (`get_results` / objective): run counted as crashed, folder kept, other runs carry on. Anything else: `Mesa.run()` logs the traceback and the runs in flight (run number, folder), then re-raises; no job is cancelled. |
 
 ### Changes from the plan
 
@@ -56,9 +65,40 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 - **A3:** the step is its own function so it can be tested without `launch()`; the
   not-on-`PATH` error and the script output in the error message are additions.
 - **A4:** written after every submit, not only "a successful submit": there is no submit-success
-  check yet (deferred to B4). Run number and iteration are cast to `int` (the engine gives numpy
-  ints, which `json` rejects). No reader function yet; B5 / D4 add one.
+  check yet. Run number and iteration are cast to `int` (the engine gives numpy ints, which
+  `json` rejects). `read_run_info()` was added in B4.
 - **A5:** message as planned.
+- **B1, B2:** as planned.
+- **B3:** the settings reach `check_convergence` through each `SolpsRun` (it is called from
+  `status()`), as one dict of keyword arguments; `check_convergence` takes a new `timescale`
+  argument. Not added to `example_input.py` (defaults unchanged).
+- **B4:** one `squeue` call per status check, not one shared call per poll (decided: simpler,
+  negligible load at a 30 min poll even with 20 slots; a shared call can be added inside `Solps`
+  later). Decided while implementing: other `squeue` states (e.g. CONFIGURING, SUSPENDED) wait
+  with no checks; `b2fstate_OK_bool` runs in `run_N/` with no arguments, any non-zero exit means
+  crashed, and not on `PATH` stops the driver with an error; needs-attention lines are logged
+  once per state. Also: the result of an ended run is kept, so later calls don't check again;
+  "unknown to both" counts polls where `sacct` succeeds but prints nothing (a failing `sacct` is
+  logged separately); `started` is set only when RUNNING is seen, so a job that runs entirely
+  between two polls gets `ended` only; times are the driver's, accurate to one poll. The
+  time limits are module constants, not settings. The `b2time.nc` lookup moved into
+  `find_time_file()`.
+- **B5:** `SolpsRun`'s hash no longer includes `run_id` (approved; in the same commit): the
+  engine keeps runs in a set, and the job ID changes on a continuation. `itmsubmit` and the
+  job-ID parsing moved unchanged into `submit_job()`. `check_convergence` returns a plain
+  `bool`. One `k` for both renames: the first number free for both `b2fstati<k>` and
+  `balance<k>.nc`.
+- **B6:** `poll_interval` is optional in input files (decided), which needed
+  `parse_input_module` to skip fields with a default. The Himmelblau example was left alone
+  (decided): with the 1800 s default it now takes about 30 h unless it passes `poll_interval`;
+  raise this in the mesa PR.
+- **B7:** decided while implementing: a run whose scoring fails keeps its folder (the crashed
+  branch's `rm -r` is skipped for it); the in-flight list gives run number and folder, not the
+  job ID (the engine doesn't know job IDs; for SOLPS the current one is the last entry in
+  `run_info.json`); the error is re-raised after logging; Ctrl-C (`KeyboardInterrupt`) is not
+  caught. Also: the traceback for a failing status check is logged once per streak; the stop
+  message is logged at error level and per-run problems at warning level; the loop moved
+  unchanged into a private `__run()`, so `run()` has a single `try`.
 - Commit messages: where the plan names the cluster, the name was dropped ("checked on scratch
   runs"), and plan labels are not referenced in commit messages.
 
@@ -75,30 +115,49 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   making `fort.1`, the run would still launch.
 - **A3, failed check leaves `run_N/` behind.** The driver stops and nothing is submitted. D4
   treats a folder without `run_info.json` as never submitted.
+- **A4 / B5, no submit-success check.** `itmsubmit`'s output is parsed for the job ID without
+  checking it worked; a failed launch or continuation gets a junk ID, which B4 then reports as
+  "unknown to squeue and sacct, needs attention" (deferred, as planned).
 - **A5:** `cleanup()`'s keep list doesn't include `b2.user.parameters`, so it is deleted from
   scored runs until C3 makes `cleanup()` keep everything.
+- **B4, check on the cluster:** the real `squeue -o "%i %T %r"` and `sacct -o State%30` output
+  (padding, other states such as `PREEMPTED` or `REQUEUED`); how long a job takes to appear in
+  `sacct` after leaving `squeue`; that `b2fstate_OK_bool` checks `b2fstate` in the current
+  directory when called with no arguments; the time limits (24 h, 1 h, 30 min).
+- **B4 / B7, missing `b2fstate_OK_bool` is retried, not a stop.** `status()` raises if
+  `run_info.json` is missing or broken at a state change, or if `b2fstate_OK_bool` is not on
+  `PATH`. B7 catches every `status()` error, so both are retried each poll (warning, then
+  needs-attention after 3) rather than stopping the driver, and the run holds its slot until the
+  cause is fixed. Proposed fix (not in the plan yet): check at start-up (in `Solps.__init__`) that
+  every outside tool the driver calls is on `PATH` (`setup_baserun_eirene_links`, `itmsubmit`,
+  `b2fstate_OK_bool`, `squeue`, `sacct`), as a small commit with series C.
+- **B5:** a continued run's intermediate files (`b2fstati<k>`, `balance<k>.nc`) are kept while it
+  runs, but `cleanup()` deletes them once the run is scored, until C3. A stalled run shows as
+  "complete" to the engine until C adds a "stalled" status. Check on the cluster that a
+  continuation restarts and appends to `run_N/b2time.nc` as in the hand-made restart.
+- **B6:** the 1800 s default is SOLPS-scale; upstream may want a smaller default (it is a
+  setting). The Himmelblau example (see above).
+- **B7:** catching every `status()` error could hide a real bug; the needs-attention line is the
+  guard, so watch for it in testing. A scoring failure gives no row in the evaluations file until
+  C2.
+- **Logging until D1:** `import mesa` calls `logging.basicConfig(level=INFO)`, so all log lines go
+  to stderr, without timestamps; the second `basicConfig` call in `mesa/__init__.py` (to
+  `runlog.log`) does nothing, and `core.logger_setup()` is never called. D1 (log to a file)
+  should deal with both.
+- **Naming:** `SolpsRun.run_id` holds the Slurm job ID of the run's current job, not an ID of the
+  run (that is `run_number`). Renaming it `job_id` would be clearer; left out as an unrelated
+  refactor.
 - **mesa commit:** the required `iteration` argument breaks existing plug-ins once (see above);
   to raise in the mesa PR.
 
-### Decided for series B (not implemented yet)
-
-- **B4, per-run states.** One `squeue -h -u <user> -o "%i %T %r"` call per poll (this replaces
-  B1's `-o %i` call). Each run is checked only for what makes sense in its state: pending (no file
-  checks; needs-attention log after 24 h), running (convergence test on the live `b2time.nc`;
-  needs-attention log if there is still no `b2time.nc` after 1 h), completing (wait;
-  needs-attention log after 30 min), not listed (ask `sacct`), ended (`balance.nc` and
-  `b2fstate_OK_bool` decide crashed vs complete). State changes are logged, and `started` /
-  `ended` times are added to the job's entry in `run_info.json` (A4's format allows extra keys).
-  The time limits are starting values to tune in testing.
-- **B5, can't judge = crashed.** At the end of a job, a missing or unreadable `b2time.nc` means
-  the run can't be judged: crashed (logged), not continued. `check_convergence` will report this
-  separately (e.g. return `None`). This narrows A1's "missing = not converged", which stays right
-  while the job is running.
-
 ### What was tested
 
-Only imports, pure functions and temp dirs; nothing that calls Slurm, and no `SolpsRun` method or
-`Solps.launch()` was run. Throwaway test scripts were kept outside the repo.
+Only imports, pure functions and temp dirs; nothing that calls Slurm, and `Solps.launch()` was
+not run. For B1, B2, B4 and B5, `SolpsRun.status()` was run on runs in temp dirs, with fake
+`squeue`, `sacct`, `b2fstate_OK_bool` and `itmsubmit` scripts first on a restricted `PATH`
+(checked to resolve to the fakes or to nothing; there was no `scancel`, real or fake). B6 and B7
+used an in-memory fake simulation with `sleep` replaced. Throwaway test scripts were kept
+outside the repo.
 
 - A1: `check_convergence` on synthetic `b2time.nc` files: missing, corrupt (logged), converged
   in `run_N/`, drifting in `b2mn.exe.dir/` (preferred), run shorter than the minimum.
@@ -115,6 +174,38 @@ Only imports, pure functions and temp dirs; nothing that calls Slurm, and no `So
   write leaves the old file intact.
 - A5: `build_solps_case` in a temp dir copies `b2.user.parameters` (when present) and no
   `fort.*` files.
+- B1: job 12345 against a queue with 123456 (no match), with 12345 (match), gone with
+  `balance.nc`, an empty job ID, an empty queue; the `squeue` arguments.
+- B2: a job still queued 100+ days after submit stays running; `timeout_hours` gone from both
+  signatures; `Solps(timeout_hours=24)` is a `TypeError`; `example_input.py` byte-compiles.
+- B3: `check_convergence` with default and changed settings on synthetic files (timescale,
+  minimum run time); `Solps` defaults, custom values, and the `ValueError` for window ≥ minimum;
+  `status()` passes the settings through (`.quit` touched or not).
+- B4: `squeue` failing; PENDING under and over 24 h (logged once, with the reason, no checks);
+  PENDING → RUNNING logged with its duration and `started` written; RUNNING with no `b2time.nc`
+  under and over 1 h, unconverged and converged (`.quit`); COMPLETING over 30 min; CONFIGURING
+  (no checks, no limit); a reason with spaces; not listed with `sacct` saying RUNNING, failing,
+  or empty for 5 polls (logged once at the 3rd, count reset); ended as COMPLETED, `CANCELLED by
+  <uid>`, FAILED, TIMEOUT, OUT_OF_MEMORY, NODE_FAIL with and without `balance.nc` and with
+  `b2fstate_OK_bool` 0 / 1; `started` and `ended` in `run_info.json`; a job that ran between two
+  polls; the result kept after the end; `b2fstate_OK_bool` not on `PATH`.
+- B5: `check_convergence` returning `None` / `False` / `True`; a healthy end converged
+  (complete), with `b2time.nc` missing or unreadable (crashed); not converged: the renames
+  (contents checked), `b2mn.prt` removed, `itmsubmit` with the same command in `run_N/`, the job
+  appended, the new job tracked through `squeue` and `sacct`, a second continuation (`k = 2`),
+  then convergence (complete, last `balance.nc`); `k` skipping used numbers; the cap (continued
+  below it, stalled at it, `max_continuations=0`, count read back from `run_info.json`); the hash
+  unchanged and the run still found in a set; `submit_job` parsing. The B4 cases rerun: all pass
+  except healthy ends with no `b2time.nc`, which are now crashed, as intended.
+- B6: the order of status checks, launches and sleeps over a whole iteration (3 runs, 2 slots);
+  a freed slot refilled in the same pass; every sleep is `poll_interval`; no sleep after the last
+  run; the default; input files with no, int, float and string `poll_interval`, and with a
+  required field missing; `build_from_input_module` passing it on.
+- B7: `status()` failing 2 and 4 times in a row (warnings, traceback once per streak,
+  needs-attention at the 3rd, reset after a good check); `get_results` and the objective failing
+  (crashed, folder kept, other runs scored); the evaluations file, a launch and the optimiser
+  failing (traceback and in-flight list logged, original error re-raised); Ctrl-C passing
+  through; a normal run unaffected; B6 rerun.
 - Imports of all `mesa_solps` modules, with mesa from the `mesa-ab` branch.
 
 ## Packaging (earlier work)
@@ -146,6 +237,8 @@ Fixes waiting to go upstream:
    mesa can't be pip-installed until this is merged.
 2. **mesa: pass the iteration number to `Simulation.launch()`** (`d484c39`, branch `mesa-ab`,
    not pushed yet). See "Current state" above.
+3. **mesa: poll interval and error handling** (`2c5d1ba`, `df8d08b`, branch `mesa-ab`, not
+   pushed yet). See "Current state" above.
 
 ### Pins and why
 
