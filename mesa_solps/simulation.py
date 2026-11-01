@@ -269,15 +269,11 @@ class SolpsRun(SimulationRun):
         logging.info(f"[solps_interface] run {self.run_number}: {message}")
 
     def cleanup(self):
-        output_files = [f for f in os.listdir(self.directory) if isfile(self.directory / f)]
-        allowed_files = (
-            "balance.nc", "input.dat", "b2.neutrals.parameters",
-            "b2.boundary.parameters", "b2.numerics.parameters",
-            "b2.transport.parameters", "b2.transport.inputfile",
-            "b2mn.dat"
-        )
-        deletions = [f for f in output_files if f not in allowed_files]
-        [os.remove(self.directory / f) for f in deletions]
+        # Keeps every file. The state files (b2fstate, b2fstati*) are needed to
+        # restart a fitted run later or re-check it, and the logs to explain an
+        # odd score. Which files can go, and how much disk a fit needs, is not
+        # known yet; a keep-list can be added once it is.
+        pass
 
     def get_results(self) -> SolpsInterface:
         results_path = self.directory / "balance.nc"
