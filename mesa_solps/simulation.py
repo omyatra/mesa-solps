@@ -143,6 +143,8 @@ class Solps(Simulation):
             values_chiiperp=chi,
         )
 
+        setup_eirene_links(case_dir)
+
         # SOLPS has to start inside the run directory (it finds ../baserun from
         # there), but the driver itself never changes directory.
         command = "itmsubmit" if self.n_proc == 1 else f'itmsubmit -m "-np {self.n_proc}" -M {self.memory}GB'
@@ -231,6 +233,36 @@ def build_solps_case(
                 \r>> but were not found in any input files with a .mesa extension.
                 """
             )
+
+
+def setup_eirene_links(run_directory: Path):
+    """
+    Runs setup_baserun_eirene_links in the run directory, which makes fort.1
+    (a link to input.dat) and the EIRENE data links a fresh run folder needs,
+    then checks that fort.1 is there. Without it EIRENE fails at start-up, so
+    an error is raised instead of launching the run.
+    """
+    try:
+        result = subprocess.run(
+            ["setup_baserun_eirene_links"],
+            cwd=run_directory,
+            capture_output=True,
+            encoding="utf-8",
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"setup_baserun_eirene_links not found on PATH, so {run_directory} "
+            f"can't be set up; run the driver in a shell with SOLPS-ITER's "
+            f"setup.csh sourced"
+        )
+
+    fort1 = run_directory / "fort.1"
+    if not isfile(fort1) or fort1.stat().st_size == 0:
+        raise RuntimeError(
+            f"setup_baserun_eirene_links did not make a non-empty fort.1 in "
+            f"{run_directory}, so the run was not launched "
+            f"(exit code {result.returncode}):\n{result.stdout}{result.stderr}"
+        )
 
 
 def check_convergence(run_directory: Path, minimum_run_time: float, window: float) -> bool:
