@@ -25,14 +25,12 @@ class SolpsRun(SimulationRun):
         directory: Path,
         launch_time: float,
         run_id: str,
-        timeout_hours: int
     ):
         self.parameters = parameters
         self.run_number = run_number
         self.directory = directory
         self.launch_time = launch_time
         self.run_id = run_id
-        self.timeout_hours = timeout_hours
 
     def status(self) -> RunStatus:
         whoami = subprocess.run("whoami", capture_output=True, encoding="utf-8")
@@ -49,8 +47,6 @@ class SolpsRun(SimulationRun):
         if self.run_id not in job_ids:
             balance_created = isfile(self.directory / "balance.nc")
             status = "complete" if balance_created else "crashed"
-        elif (time() - self.launch_time) > self.timeout_hours * 3600.:
-            status = "timed-out"
         elif check_convergence(self.directory, minimum_run_time=1e-3, window=2e-4):
             quit_file = self.directory / "b2mn.exe.dir/.quit"
             if not isfile(quit_file):
@@ -92,7 +88,6 @@ class Solps(Simulation):
         transport_profile_bounds: tuple[float, float],
         n_proc: int = 1,
         memory_gb: int = 20,
-        timeout_hours: int = 24,
     ):
         # absolute, so it doesn't depend on the current directory
         self.reference_directory = Path(reference_directory).resolve()
@@ -102,7 +97,6 @@ class Solps(Simulation):
         check_transport_template(self.reference_directory / "b2.transport.inputfile")
         self.n_proc = n_proc
         self.memory = memory_gb
-        self.timeout_hours = timeout_hours
 
     def launch(
         self,
@@ -185,7 +179,6 @@ class Solps(Simulation):
             run_number=run_number,
             parameters=parameters,
             launch_time=submit_time,
-            timeout_hours=self.timeout_hours
         )
 
 
