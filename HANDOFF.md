@@ -1,23 +1,28 @@
 # Handoff: mesa-solps
 
-## Current state: driver fixes, series A, B and C done
+## Current state: driver fixes, series A, B, C and D done
 
 Fixes to the SOLPS driver are being made from a commit plan kept outside this repo, as series of
 commits labelled A1, A2, ... (A: launching runs, B: polling, C: failures and results, D: logging,
-heartbeat and resume). **Series A (A1–A5), B (B1–B7) and C (C1–C5) are done. Series D is next.**
-Each commit message's "Tested:" section is still empty: it is filled in after the tests on the
-cluster.
+heartbeat and resume). **All four series are done: A (A1–A5), B (B1–B7), C (C1–C5) and D
+(D1–D4).** Each commit message's "Tested:" section is still empty: it is filled in after the tests
+on the cluster.
+
+**Next:** push the mesa branch, then move the mesa pin in `pyproject.toml` to its last commit (the
+last commit of the plan), then the cluster tests (see "What the cluster tests must check" below),
+then fill in the "Tested:" sections.
 
 Branches (local, not pushed):
 
 - mesa-solps: `worktree-mesa-ab`
-- mesa: `mesa-ab` (five commits: one needed by A4, then B6, B7, C1 and C2)
+- mesa: `mesa-ab` (eight commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3)
 
 **mesa-solps needs mesa from the `mesa-ab` branch.** From A4 on, `Solps.launch()` takes
 `iteration`, which only mesa `d484c39` and later pass. B6 (poll interval), B7 (error handling),
 C1 (safe evaluations file) and C2 (status column, `"stalled"`) are engine changes the driver needs
 too. From C4 on, the plug-in returns `"stalled"`, which an older engine doesn't know: the run
-would never leave its slot and the iteration would never end. The `pyproject.toml` pin still
+would never leave its slot and the iteration would never end. D4's adoption hooks and
+`SolpsRun.job_id` are only used by an engine with D2 and D3. The `pyproject.toml` pin still
 points at `468c754`, so
 `pip install .` alone installs a mesa that doesn't pass `iteration`, and the first launch fails
 with a TypeError (before anything is created or submitted). Until the pin moves (the last commit
@@ -52,6 +57,11 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | C3    | mesa-solps | `d74d919` | `cleanup()` keeps every file (no-op with a comment); the engine still calls it. |
 | C4    | mesa-solps | `dc560c8` | At the continuation cap, `status()` returns `"stalled"` (was `"complete"`). Each crash line in `check_ended()` ends with the job ID and its sacct State, e.g. "(job 1234 ended as NODE_FAIL)". |
 | C5    | mesa-solps | `6c54195` | At start-up (in `Solps.__init__`), `check_tools()` checks that `setup_baserun_eirene_links`, `itmsubmit`, `squeue`, `sacct` and `b2fstate_OK_bool` (`required_tools`) are on `PATH`, and raises an error listing the missing ones. |
+| D1    | mesa | `dad79c4` | No `basicConfig` at import. `Mesa.run()` calls `logger_setup(simulations_directory)` first: `mesa.log` in the simulations directory (appended to) and the screen, both with timestamps, every logger at INFO and above. Handlers are added directly (works if logging was configured earlier; a second call for the same folder adds nothing). |
+| D2    | mesa | `4277d15` | `heartbeat.json` in the simulations directory (tmp file + rename), written at start-up and after each pass: `state` `"running"`, time, host, PID, iteration, runs in flight (run number, `job_id`, last status). On a stop in `run()` (finished, error, Ctrl-C) it is rewritten as `"stopped"` with `stopped_by`, unless it now holds another host/PID. At start-up a `"running"` heartbeat younger than 2 × `poll_interval`, or an unreadable one, is an error ("another driver may be running ..."); `"stopped"` never blocks; an older `"running"` one is taken over with a warning. Optional `SimulationRun.job_id` (default `None`). |
+| –     | mesa-solps | `1465b36` | `SolpsRun.job_id`: read-only property returning `run_id`, so the heartbeat shows the current Slurm job. |
+| D3    | mesa | `a1a81f8` | Optional hooks `Simulation.existing_run_numbers()` and `Simulation.adopt()` (defaults: empty set / `None`), optional `SimulationRun.iteration`. At start-up every folder number with no evaluation row is adopted and polled with the normal handling until recorded, each with its own iteration, before new points are proposed; one that can't be adopted (`None`, an error, no iteration) is logged as needing attention and skipped. Per-run handling moved unchanged into `__check_run`, used by both loops. Next run number = max(rows, folders) + 1. |
+| D4    | mesa-solps | `76cedec` | `Solps.existing_run_numbers()`: the N of every `run_N/` folder. `Solps.adopt()`: no `run_info.json` → `None`; else a `SolpsRun` with run number, iteration, parameters and the last job, its Slurm state starting as last recorded (RUNNING since `started` if started and not ended, else PENDING since its submit time). `SolpsRun` takes `iteration`; the submit command is worked out once in `Solps.__init__`. |
 
 ### Changes from the plan
 
@@ -132,6 +142,36 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   The check runs first in `Solps.__init__`, before the template check. Building a `Solps` now
   needs the five tools on `PATH` (tests need placeholders).
 - No commits were added in series C.
+- **D1:** nothing calls `build_from_input_module`; input files build `Mesa(...)` and call `run()`,
+  so `Mesa.run()` calls `logger_setup()`. Handlers are added directly rather than with
+  `basicConfig` (which does nothing if logging was already configured), and a second call for the
+  same folder adds nothing. The screen now has timestamps too. Errors raised before `run()` (e.g.
+  `Solps.__init__`'s checks) only reach the screen. Code that calls `launch_iteration` directly no
+  longer gets INFO on the screen.
+- **D2 (decided):** the heartbeat is marked `"stopped"` (with the reason) on every stop that
+  reaches `run()`'s `finally`, instead of being left as is, so a restart after a clean stop or an
+  error stop needs no override; a killed driver still leaves a `"running"` heartbeat for the age
+  check. The stop write is skipped if the file holds another host/PID, and its failure is logged
+  without hiding the original error. A heartbeat is also written at start-up (claims the case at
+  once). The job ID comes from a new optional `SimulationRun.job_id`. Decided while
+  implementing: the age is taken from the `time` field (local ISO time with UTC offset); a missing
+  or bad time, or an unreadable file, blocks start-up; the start-up check runs before the
+  `try`, so a refusal never touches the other driver's file. Runs show `launched`, the last
+  `status()` result, or `status check failed`.
+- **Added mesa-solps commit** (`1465b36`, decided with D2): `SolpsRun.job_id` returns `run_id`, so
+  the engine reads the job ID generically. Its own commit, so D4 stays about adoption. `run_id`
+  was not renamed.
+- **D3:** adopted runs must be recorded with their own iteration, which the plan's
+  `adopt() -> SimulationRun` can't return, so `SimulationRun` gets an optional `iteration`. The
+  per-run handling is shared (`__check_run`), not copied; the one ordering change is that
+  `cleanup()` now runs before the run leaves the in-flight set. Decided while implementing:
+  `adopt()` raising counts as "can't be adopted" (warning with traceback); during adoption the
+  heartbeat's `iteration` is `null`; an unadoptable folder is warned about again on every restart.
+- **D4:** `adopt()` also sets the job's starting Slurm state from `run_info.json` (not in the
+  plan): without it a still-running job logs a false "PENDING -> RUNNING after <time since first
+  submit>" and the "no `b2time.nc` for 1 h" timer restarts at adoption. `SolpsRun` takes a
+  required `iteration`. The submit command moved unchanged into `Solps.__init__` so continuations
+  of adopted runs use the same one.
 - Commit messages: where the plan names the cluster, the name was dropped ("checked on scratch
   runs", C3's disk sizes), and plan labels are not referenced in commit messages.
 
@@ -146,8 +186,9 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   MAST-U fits; χe/χi kind labels possibly swapped in `transport.py` (harmless while χi = χe).
 - **A3:** the script's exit code is not checked, only `fort.1`. If the script can fail after
   making `fort.1`, the run would still launch.
-- **A3, failed check leaves `run_N/` behind.** The driver stops and nothing is submitted. D4
-  treats a folder without `run_info.json` as never submitted.
+- **A3, failed check leaves `run_N/` behind.** The driver stops and nothing is submitted. On a
+  restart, D3/D4 log the folder (no `run_info.json`) as needing attention and skip it, on every
+  restart until it is removed by hand; new run numbers go past it.
 - **A4 / B5, no submit-success check.** `itmsubmit`'s output is parsed for the job ID without
   checking it worked; a failed launch or continuation gets a junk ID, which B4 then reports as
   "unknown to squeue and sacct, needs attention" (deferred, as planned).
@@ -178,31 +219,41 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   iterable"), before and after C2; SOLPS fits have several, so it doesn't affect them. The
   initial-sample count `n_evals` is the highest run number, not the number of runs: run numbers
   start at 0, so after 20 initial runs `n_evals` is 19 and one more random run is drawn before
-  the GP phase starts. Check with the mesa author.
+  the GP phase starts. Check with the mesa author. D3 doesn't depend on `n_evals` and doesn't
+  change it, but folders that can't be adopted leave gaps in the run numbers, and each gap below
+  the highest number counts as an initial sample that never ran.
 - **C3, disk use:** every file of every run is kept. Measure a real fit's disk use in testing,
   then decide a keep-list (tarball vs loose files, `*.last10`, `2d_profiles/`, `fort.15` on
   restart).
 - **C5:** `whoami`, `touch` and `scancel` are called but not checked (see "Changes from the
   plan").
-- **Logging until D1:** `import mesa` calls `logging.basicConfig(level=INFO)`, so all log lines go
-  to stderr, without timestamps; the second `basicConfig` call in `mesa/__init__.py` (to
-  `runlog.log`) does nothing, and `core.logger_setup()` is never called. D1 (log to a file)
-  should deal with both.
+- **D1:** if a user's input file adds its own screen handler, lines appear twice on the screen.
+- **D2:** a failing per-pass heartbeat write stops the driver (the "anything else" rule); only the
+  stop write is guarded. A driver that stalls longer than 2 × `poll_interval` while another one
+  takes over only notices when it stops. The age limit uses the new driver's `poll_interval`.
+- **D2 / D3, engine API additions:** optional `SimulationRun.job_id` and `SimulationRun.iteration`,
+  optional `Simulation.existing_run_numbers()` and `Simulation.adopt()`. No change for existing
+  plug-ins; to raise in the mesa PR.
+- **D4, short windows a restart doesn't handle:** a driver killed inside a continuation, after
+  the renames but before the new job is recorded, leaves a run that is judged "crashed" when
+  adopted (`balance.nc` already renamed); a driver killed between `itmsubmit` and writing
+  `run_info.json` leaves a job running in a folder that can't be adopted (needs attention).
 - **Naming:** `SolpsRun.run_id` holds the Slurm job ID of the run's current job, not an ID of the
-  run (that is `run_number`). Renaming it `job_id` would be clearer; left out as an unrelated
-  refactor.
+  run (that is `run_number`). Since `1465b36` a read-only `job_id` property returns it; renaming
+  the attribute itself to `job_id` would be clearer, left out as an unrelated refactor.
 - **mesa commit:** the required `iteration` argument breaks existing plug-ins once (see above);
   to raise in the mesa PR.
 
 ### What was tested
 
-Only imports, pure functions and temp dirs; nothing that calls Slurm, and `Solps.launch()` was
-not run. For B1, B2, B4, B5 and C4, `SolpsRun.status()` was run on runs in temp dirs, with fake
-`squeue`, `sacct`, `b2fstate_OK_bool` and `itmsubmit` scripts first on a restricted `PATH`
-(checked to resolve to the fakes or to nothing; there was no `scancel`, real or fake). C3 called
-`SolpsRun.cleanup()` on a run in a temp dir, and C5 built `Solps` with placeholder tools on such
-a `PATH`. B6, B7, C1 and C2 used an in-memory fake simulation with `sleep` replaced. Throwaway
-test scripts were kept outside the repo.
+Only imports, pure functions and temp dirs; nothing that calls Slurm, and neither
+`Solps.launch()` nor `Mesa.run()` with the SOLPS plug-in was run. For B1, B2, B4, B5, C4, the
+`job_id` commit and D4, `SolpsRun.status()` was run on runs in temp dirs, with fake `squeue`,
+`sacct`, `b2fstate_OK_bool` and `itmsubmit` scripts first on a restricted `PATH` (checked to
+resolve to the fakes or to nothing; there was no `scancel`, real or fake). C3 called
+`SolpsRun.cleanup()` on a run in a temp dir, and C5 and D4 built `Solps` with placeholder tools on
+such a `PATH`. B6, B7, C1, C2 and D1–D3 used an in-memory fake simulation with `sleep` replaced.
+Throwaway test scripts were kept outside the repo.
 
 - A1: `check_convergence` on synthetic `b2time.nc` files: missing, corrupt (logged), converged
   in `run_N/`, drifting in `b2mn.exe.dir/` (preferred), run shorter than the minimum.
@@ -275,7 +326,76 @@ test scripts were kept outside the repo.
 - C5: all tools present → `Solps` builds; each tool missing alone → error naming only it; two
   missing → both listed in order; all missing with a bad reference → the tool error comes
   first; a non-executable tool counts as missing; nothing created.
+- D1: `import mesa` adds no handler and writes no file. A run with the fake simulation: `mesa.log`
+  in the simulations directory (nothing in the current directory), timestamped lines from the
+  engine and another logger, the status-check and scoring warnings with their tracebacks, the
+  same lines on the screen; a second `run()` in one process doesn't double lines; a restart
+  appends; an error stop logs the stop line, traceback and "no runs in flight" to the file.
+- D2: the start-up heartbeat (running, no iteration, nothing in flight), per-pass heartbeats
+  (`launched`, last status, `status check failed`, `job_id` or `null`, numpy run numbers as
+  ints), the stop record for finished, an error and Ctrl-C; refused for a young, a time-less and
+  a 199 s old (limit 200 s) `"running"` heartbeat and an unreadable one (file untouched, nothing
+  launched, error in `mesa.log`); a stopped one doesn't block; a 201 s old one is taken over; the
+  guard leaves another driver's heartbeat alone; a failing stop write is logged and the original
+  error still raised.
+- `job_id` commit: `job_id` follows `run_id` through a continuation (fake `itmsubmit`), hash
+  unchanged, read-only; a `Mesa` heartbeat with a `SolpsRun` in flight shows the job ID.
+- D3: a driver killed mid-iteration (runs 1, 2 in flight), plus a never-submitted and a broken
+  folder; the next driver adopts only unrecorded folders, skips the two with "needs attention",
+  records the adopted runs with their own iteration through the normal handling (status-check
+  warning, `cleanup()`), calls the strategy only afterwards, numbers new runs past the folders; a
+  third driver retries only the unadoptable folders; an error during adoption lists the adopted
+  runs in the error log and the stopped heartbeat; default hooks keep the old numbering; an
+  adopted run with no iteration is skipped.
+- D4: `existing_run_numbers` ignores files and non-`run_N` names; `adopt` rebuilds number,
+  iteration, parameters, last job, folder, settings and the starting Slurm state (PENDING since
+  submit, or RUNNING since `started`), returns `None` with no `run_info.json`, raises on a broken
+  one, calls no tool. `status()` on adopted runs: still running (no false state change,
+  needs-attention timed from `started`), PENDING → RUNNING (`started` written), ended while no
+  driver ran (complete, `ended` written), continued with `Solps`' submit command, stalled at the
+  cap counted from `run_info.json`, crashed with the job and sacct state. The engine's adoption
+  step (called directly, not through `Mesa.run()`) with `Solps`: rows with each run's iteration,
+  `cleanup()` for complete runs, the never-submitted folder skipped, nothing submitted.
+- Reruns after each D commit: earlier tests fail only where an earlier change was intended (C2's
+  status column and scoring-failure rows, C5's tool check, old `SolpsRun` signatures) or where a
+  test counted log lines or `read_hdf` calls that D1/D3 changed; checked against the commit before.
 - Imports of all `mesa_solps` modules, with mesa from the `mesa-ab` branch.
+
+### What the cluster tests must check
+
+Gathered from all series; none of this could be tested here.
+
+- **Transport file (A2):** on both MAST-U references (D-only and D + C), each run's
+  `b2.transport.inputfile` differs from the reference only in the kind 1, 3 and 4 blocks.
+- **Run folder set-up (A3, A5):** `setup_baserun_eirene_links` makes `fort.1` and EIRENE starts;
+  `b2.user.parameters` is copied; no `fort.*` from the reference.
+- **Submit (A4):** the job ID parsed from `itmsubmit` is right; `run_info.json` is written.
+- **Slurm output (B1, B4):** the real `squeue -o "%i %T %r"` and `sacct -o State%30` output
+  (padding, states such as `PREEMPTED` or `REQUEUED`); how long a job takes to appear in `sacct`
+  after leaving `squeue`; `b2fstate_OK_bool` with no arguments checks `b2fstate` in the current
+  directory; whether the 24 h / 1 h / 30 min attention limits suit.
+- **Convergence and continuation (B3, B5, C4):** `.quit` is touched and SOLPS stops cleanly; a
+  continuation restarts from `b2fstati` and appends to `b2time.nc`; the cap gives `"stalled"`.
+- **Crashes (B4, C2, C4):** a crashed run gets a row with its status and the sacct state in the
+  log, keeps its folder, and the other runs carry on; watch whether the GP re-proposes crashed
+  points (crash loop).
+- **Poll interval (B6):** 1800 s against real job lengths.
+- **Error handling (B7):** watch for "status check failing, needs attention" lines.
+- **Evaluations file (C1, C2):** rows, types and the `status` column after a real fit; read back
+  in pandas.
+- **Disk use (C3):** measure a real fit, then decide a keep-list.
+- **Logging (D1):** `mesa.log` in the case folder, appended across restarts, with B4's state
+  lines and any tracebacks.
+- **Heartbeat (D2):** `cat heartbeat.json` from another login node while the driver runs; a
+  second driver on the same case is refused; after a clean stop or error stop a restart works at
+  once; after killing the driver (close the session) a restart is refused until 2 ×
+  `poll_interval` has passed or the file is deleted.
+- **Resume (D3, D4):** kill the driver with runs pending, running, and finished but not yet
+  recorded; restart: each is adopted, followed to the end and recorded with its iteration, new
+  run numbers don't clash, and a never-submitted folder is logged and skipped. Kill it again
+  during a continuation's resubmit only if the D4 window above is worth checking.
+- **Tools at start-up (C5):** the driver starts in a shell with SOLPS-ITER's `setup.csh` sourced
+  and stops with the list of missing tools otherwise.
 
 ## Packaging (earlier work)
 
@@ -310,6 +430,8 @@ Fixes waiting to go upstream:
    pushed yet). See "Current state" above.
 4. **mesa: safe evaluations file; a row for every run** (`5f2dd57`, `2014bc3`, branch
    `mesa-ab`, not pushed yet). See "Current state" above.
+5. **mesa: log file, heartbeat, resume** (`dad79c4`, `4277d15`, `a1a81f8`, branch `mesa-ab`,
+   not pushed yet). See "Current state" above.
 
 ### Pins and why
 
