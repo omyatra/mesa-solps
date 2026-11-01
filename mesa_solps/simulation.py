@@ -66,6 +66,12 @@ class SolpsRun(SimulationRun):
         # set once the job has ended: "complete", "stalled" or "crashed"
         self.final_status = None
 
+    @property
+    def job_id(self) -> str:
+        # the Slurm job ID of the run's current job, for the engine's
+        # heartbeat file; follows run_id, which changes on a continuation
+        return self.run_id
+
     def status(self) -> RunStatus:
         """
         Checks the run once per poll, only for what makes sense in the job's
