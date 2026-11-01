@@ -13,8 +13,8 @@ dependency pins and open issues.
   (`SolpsRun.cleanup`). Testing is limited to imports and pure functions (`models`,
   `transport` writing to a temp dir).
 - Never use ssh or touch clusters.
-- Don't edit the dependency repos (mesa, sim-solps) from here. Fixes to them go in their own
-  repos as separate commits, so they can go upstream as PRs.
+- Fixes to mesa or sim-solps are committed in their own repo (on a branch, as separate commits for
+  upstream PRs). Never patch them inside mesa-solps or in site-packages.
 - Keep commits upstreamable: packaging, fixes and docs go in separate commits, with no
   unrelated refactoring.
 - This repo is public. Keep committed files about the code: no personal notes, user names,
