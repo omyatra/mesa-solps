@@ -39,6 +39,8 @@ class SolpsRun(SimulationRun):
         launch_time: float,
         run_id: str,
         convergence_settings: dict[str, float],
+        submit_command: str,
+        max_continuations: int,
     ):
         self.parameters = parameters
         self.run_number = run_number
@@ -47,6 +49,9 @@ class SolpsRun(SimulationRun):
         self.run_id = run_id
         # keyword arguments for check_convergence, from Solps
         self.convergence_settings = convergence_settings
+        # for continuing the run in the same folder, from Solps
+        self.submit_command = submit_command
+        self.max_continuations = max_continuations
 
         # Slurm state of the job as last seen, and since when (driver's clock)
         self.job_state = "PENDING"
@@ -134,7 +139,11 @@ class SolpsRun(SimulationRun):
             return "running"
 
         self.change_state(sacct_state)
-        self.final_status = self.check_ended()
+        result = self.check_ended()
+        if result == "continue":
+            self.continue_run()
+            return "running"
+        self.final_status = result
         return self.final_status
 
     def check_running(self):
@@ -150,8 +159,12 @@ class SolpsRun(SimulationRun):
             if not isfile(quit_file):
                 subprocess.run(["touch", quit_file], encoding="utf-8")
 
-    def check_ended(self) -> RunStatus:
-        """The job has ended, so its output should all be there now."""
+    def check_ended(self) -> str:
+        """
+        The job has ended, so its output should all be there now. Returns
+        "crashed", "complete", or "continue" if the run ended cleanly but
+        hasn't converged.
+        """
         if not isfile(self.directory / "balance.nc"):
             self.log("crashed: the job ended without writing balance.nc")
             return "crashed"
@@ -174,7 +187,57 @@ class SolpsRun(SimulationRun):
                 f"(exit code {ok_bool.returncode})"
             )
             return "crashed"
-        return "complete"
+
+        converged = check_convergence(self.directory, **self.convergence_settings)
+        if converged is None:
+            self.log(
+                "crashed: the job ended cleanly but its b2time.nc is missing "
+                "or unreadable, so convergence can't be judged"
+            )
+            return "crashed"
+        if converged:
+            return "complete"
+
+        # the count is taken from run_info.json, so it survives a driver restart
+        continuations = len(read_run_info(self.directory)["jobs"]) - 1
+        if continuations >= self.max_continuations:
+            self.log(
+                f"stalled: not converged after {continuations} continuations; "
+                f"scored from its last balance.nc"
+            )
+            return "complete"
+        return "continue"
+
+    def continue_run(self):
+        """
+        Continues the run in its own folder from the state it ended in, keeping
+        the previous b2fstati and balance.nc as b2fstati<k> and balance<k>.nc.
+        """
+        d = self.directory
+        k = 1
+        while (d / f"b2fstati{k}").exists() or (d / f"balance{k}.nc").exists():
+            k += 1
+        os.rename(d / "b2fstati", d / f"b2fstati{k}")
+        os.rename(d / "b2fstate", d / "b2fstati")
+        # any balance.nc after a job is then that job's own
+        os.rename(d / "balance.nc", d / f"balance{k}.nc")
+        if isfile(d / "b2mn.prt"):
+            os.remove(d / "b2mn.prt")
+
+        job_id, submit_time = submit_job(d, self.submit_command)
+        info = read_run_info(d)
+        info["jobs"].append({"job_id": job_id, "submit_time": timestamp(submit_time)})
+        write_run_info(d, info)
+        self.log(
+            f"not converged; continued as job {job_id} "
+            f"(continuation {len(info['jobs']) - 1} of at most {self.max_continuations})"
+        )
+
+        self.run_id = job_id
+        self.job_state = "PENDING"
+        self.job_state_since = submit_time
+        self.attention_logged = False
+        self.unknown_polls = 0
 
     def change_state(self, state: str):
         """Logs a change of the job's Slurm state and records it in run_info.json."""
@@ -224,7 +287,9 @@ class SolpsRun(SimulationRun):
         subprocess.run(["scancel", self.run_id])
 
     def __key(self):
-        return self.run_id, self.directory, self.run_number, self.launch_time
+        # not run_id: it changes when the run is continued, and the engine
+        # keeps runs in a set
+        return self.directory, self.run_number, self.launch_time
 
     def __hash__(self):
         return hash(self.__key())
@@ -240,6 +305,7 @@ class Solps(Simulation):
         convergence_min_run_time: float = 1e-3,
         convergence_window: float = 2e-4,
         convergence_timescale: float = 1.0,
+        max_continuations: int = 10,
     ):
         # absolute, so it doesn't depend on the current directory
         self.reference_directory = Path(reference_directory).resolve()
@@ -261,6 +327,8 @@ class Solps(Simulation):
             "window": convergence_window,
             "timescale": convergence_timescale,
         }
+        # how many times a run that ends unconverged is continued
+        self.max_continuations = max_continuations
 
     def launch(
         self,
@@ -313,17 +381,8 @@ class Solps(Simulation):
 
         setup_eirene_links(case_dir)
 
-        # SOLPS has to start inside the run directory (it finds ../baserun from
-        # there), but the driver itself never changes directory.
-        command = "itmsubmit" if self.n_proc == 1 else f'itmsubmit -m "-np {self.n_proc}" -M {self.memory}GB'
-        start_run = subprocess.run(command, stdout=subprocess.PIPE, shell=True, cwd=case_dir)
-
-        start_run_output = start_run.stdout
-        # Find the batch job number
-        findstr = 'Submitted batch job'
-        tmp = str(start_run_output).find(findstr)
-        job_id = str(start_run_output)[tmp + len(findstr) + 1:-3]
-        submit_time = time()
+        submit_command = "itmsubmit" if self.n_proc == 1 else f'itmsubmit -m "-np {self.n_proc}" -M {self.memory}GB'
+        job_id, submit_time = submit_job(case_dir, submit_command)
 
         write_run_info(
             case_dir,
@@ -344,7 +403,23 @@ class Solps(Simulation):
             parameters=parameters,
             launch_time=submit_time,
             convergence_settings=self.convergence_settings,
+            submit_command=submit_command,
+            max_continuations=self.max_continuations,
         )
+
+
+def submit_job(run_directory: Path, command: str) -> tuple[str, float]:
+    """Submits the run in run_directory; returns the job ID and submit time."""
+    # SOLPS has to start inside the run directory (it finds ../baserun from
+    # there), but the driver itself never changes directory.
+    start_run = subprocess.run(command, stdout=subprocess.PIPE, shell=True, cwd=run_directory)
+
+    start_run_output = start_run.stdout
+    # Find the batch job number
+    findstr = 'Submitted batch job'
+    tmp = str(start_run_output).find(findstr)
+    job_id = str(start_run_output)[tmp + len(findstr) + 1:-3]
+    return job_id, time()
 
 
 def build_solps_case(
@@ -488,15 +563,19 @@ def find_time_file(run_directory: Path) -> Path | None:
 
 def check_convergence(
     run_directory: Path, minimum_run_time: float, window: float, timescale: float
-) -> bool:
+) -> bool | None:
     """
     The run is converged if it has run for at least minimum_run_time (s of
     simulated time) and, over the last window (s), every monitored ne and Te
     changes on a timescale longer than timescale (s).
+
+    Returns None if it can't be judged: b2time.nc is missing or can't be
+    read. While the job runs that is normal (not converged yet); once the
+    job has ended it means the run failed.
     """
     time_file = find_time_file(run_directory)
     if time_file is None:
-        return False
+        return None
 
     try:
         with netcdf.netcdf_file(time_file, "r") as solps:
@@ -506,7 +585,7 @@ def check_convergence(
     except Exception as error:
         # e.g. the file is read while SOLPS is writing it; try again next poll
         logging.info(f"[solps_interface] could not read {time_file}: {error!r}")
-        return False
+        return None
 
     run_time = time.max() - time.min()
     if run_time < minimum_run_time:
@@ -525,4 +604,4 @@ def check_convergence(
 
 
     converged = (te_timescales > timescale).all() and (ne_timescales > timescale).all()
-    return converged
+    return bool(converged)
