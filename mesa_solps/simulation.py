@@ -2,6 +2,7 @@ from pathlib import Path
 from datetime import datetime
 import json
 import os
+import re
 from os.path import isfile
 from time import time
 import logging
@@ -40,6 +41,7 @@ class SolpsRun(SimulationRun):
         self,
         parameters: dict[str, float],
         run_number: int,
+        iteration: int,
         directory: Path,
         launch_time: float,
         run_id: str,
@@ -49,6 +51,7 @@ class SolpsRun(SimulationRun):
     ):
         self.parameters = parameters
         self.run_number = run_number
+        self.iteration = iteration
         self.directory = directory
         self.launch_time = launch_time
         self.run_id = run_id
@@ -327,6 +330,9 @@ class Solps(Simulation):
         check_transport_template(self.reference_directory / "b2.transport.inputfile")
         self.n_proc = n_proc
         self.memory = memory_gb
+        self.submit_command = (
+            "itmsubmit" if n_proc == 1 else f'itmsubmit -m "-np {n_proc}" -M {memory_gb}GB'
+        )
 
         # convergence test (check_convergence), all in seconds of simulated time
         if not convergence_window < convergence_min_run_time:
@@ -393,8 +399,7 @@ class Solps(Simulation):
 
         setup_eirene_links(case_dir)
 
-        submit_command = "itmsubmit" if self.n_proc == 1 else f'itmsubmit -m "-np {self.n_proc}" -M {self.memory}GB'
-        job_id, submit_time = submit_job(case_dir, submit_command)
+        job_id, submit_time = submit_job(case_dir, self.submit_command)
 
         write_run_info(
             case_dir,
@@ -412,12 +417,67 @@ class Solps(Simulation):
             run_id=job_id,
             directory=case_dir,
             run_number=run_number,
+            iteration=iteration,
             parameters=parameters,
             launch_time=submit_time,
             convergence_settings=self.convergence_settings,
-            submit_command=submit_command,
+            submit_command=self.submit_command,
             max_continuations=self.max_continuations,
         )
+
+    def existing_run_numbers(self, simulations_directory: Path, **kwargs) -> set[int]:
+        """The N of every run_N/ folder in the simulations directory."""
+        return {
+            int(match.group(1))
+            for path in Path(simulations_directory).resolve().iterdir()
+            if path.is_dir() and (match := re.fullmatch(r"run_(\d+)", path.name))
+        }
+
+    def adopt(
+        self, run_number: int, simulations_directory: Path, **kwargs
+    ) -> SolpsRun | None:
+        """
+        Rebuilds a run left in flight by an earlier driver from its
+        run_N/run_info.json: run number, iteration, parameters, and the last
+        job in "jobs", whose Slurm state the run then follows with status()
+        as usual. Returns None if there is no run_info.json: the run was never
+        submitted (e.g. stopped by the EIRENE-links check). A broken
+        run_info.json raises.
+        """
+        case_dir = Path(simulations_directory).resolve() / f"run_{run_number}"
+        if not isfile(case_dir / "run_info.json"):
+            logging.info(
+                f"[solps_interface] run {run_number}: no run_info.json, so it "
+                f"was never submitted; not adopted"
+            )
+            return None
+        info = read_run_info(case_dir)
+        jobs = info["jobs"]
+        last_job = jobs[-1]
+        run = SolpsRun(
+            run_id=last_job["job_id"],
+            directory=case_dir,
+            run_number=run_number,
+            iteration=info["iteration"],
+            parameters=info["parameters"],
+            launch_time=datetime.fromisoformat(jobs[0]["submit_time"]).timestamp(),
+            convergence_settings=self.convergence_settings,
+            submit_command=self.submit_command,
+            max_continuations=self.max_continuations,
+        )
+        # the job's state as last recorded, so the first poll logs only a real
+        # change, and the needs-attention times count from the right moment
+        if "started" in last_job and "ended" not in last_job:
+            run.job_state = "RUNNING"
+            run.job_state_since = datetime.fromisoformat(last_job["started"]).timestamp()
+        else:
+            run.job_state = "PENDING"
+            run.job_state_since = datetime.fromisoformat(last_job["submit_time"]).timestamp()
+        run.log(
+            f"adopted: job {run.run_id} ({len(jobs)} job(s) so far), "
+            f"last seen {run.job_state}"
+        )
+        return run
 
 
 def submit_job(run_directory: Path, command: str) -> tuple[str, float]:
