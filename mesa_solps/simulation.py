@@ -29,6 +29,11 @@ no_time_file_attention_hours = 1.0  # RUNNING without a b2time.nc
 completing_attention_hours = 0.5  # COMPLETING
 unknown_attention_polls = 3  # polls in a row unknown to both squeue and sacct
 
+# Outside tools the driver calls, checked at start-up (in Solps.__init__)
+required_tools = (
+    "setup_baserun_eirene_links", "itmsubmit", "squeue", "sacct", "b2fstate_OK_bool"
+)
+
 
 class SolpsRun(SimulationRun):
     def __init__(
@@ -306,6 +311,8 @@ class Solps(Simulation):
         convergence_timescale: float = 1.0,
         max_continuations: int = 10,
     ):
+        # stop now, before any run folder is created, if a tool is missing
+        check_tools()
         # absolute, so it doesn't depend on the current directory
         self.reference_directory = Path(reference_directory).resolve()
         self.transport_bounds = transport_profile_bounds
@@ -547,6 +554,16 @@ def setup_eirene_links(run_directory: Path):
             f"setup_baserun_eirene_links did not make a non-empty fort.1 in "
             f"{run_directory}, so the run was not launched "
             f"(exit code {result.returncode}):\n{result.stdout}{result.stderr}"
+        )
+
+
+def check_tools():
+    """Raises an error listing the outside tools that are not on PATH."""
+    missing = [tool for tool in required_tools if sh.which(tool) is None]
+    if missing:
+        raise RuntimeError(
+            f"not found on PATH: {', '.join(missing)}; run the driver in a shell "
+            f"with SOLPS-ITER's setup.csh sourced, on a machine with Slurm"
         )
 
 
