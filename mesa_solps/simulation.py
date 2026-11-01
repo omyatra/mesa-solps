@@ -1,4 +1,6 @@
 from pathlib import Path
+from datetime import datetime
+import json
 import os
 from os.path import isfile
 from time import time
@@ -102,8 +104,10 @@ class Solps(Simulation):
     def launch(
         self,
         run_number: int,
+        iteration: int,
         simulations_directory: Path,
         parameters: dict,
+        **kwargs,
     ) -> SolpsRun:
         """
         Evaluates SOLPS for the provided transport profiles and saves the results.
@@ -111,6 +115,9 @@ class Solps(Simulation):
         :param int run_number: \
             The run number corresponding to the requested SOLPS run, used to name
             directory in which the SOLPS output is stored.
+
+        :param int iteration: \
+            The iteration the run belongs to, recorded in run_N/run_info.json.
 
         :param str simulations_directory: \
 
@@ -155,6 +162,18 @@ class Solps(Simulation):
         findstr = 'Submitted batch job'
         tmp = str(start_run_output).find(findstr)
         job_id = str(start_run_output)[tmp + len(findstr) + 1:-3]
+        submit_time = time()
+
+        write_run_info(
+            case_dir,
+            {
+                # int() as the engine's numbers can be numpy ints, which json rejects
+                "run_number": int(run_number),
+                "iteration": int(iteration),
+                "parameters": {k: float(v) for k, v in parameters.items()},
+                "jobs": [{"job_id": job_id, "submit_time": timestamp(submit_time)}],
+            },
+        )
 
         logging.info(f'[solps_interface] Submitted job {job_id}')
         return SolpsRun(
@@ -162,7 +181,7 @@ class Solps(Simulation):
             directory=case_dir,
             run_number=run_number,
             parameters=parameters,
-            launch_time=time(),
+            launch_time=submit_time,
             timeout_hours=self.timeout_hours
         )
 
@@ -233,6 +252,24 @@ def build_solps_case(
                 \r>> but were not found in any input files with a .mesa extension.
                 """
             )
+
+
+def timestamp(t: float) -> str:
+    """Local time with its UTC offset, e.g. 2026-11-01T16:30:00+00:00."""
+    return datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+
+
+def write_run_info(run_directory: Path, info: dict):
+    """
+    Writes run_directory/run_info.json: the run number, iteration, parameters
+    and "jobs", one entry per submitted job (job ID, submit time). It is
+    written to a tmp file first and renamed, so it is never left half-written.
+    """
+    tmp_file = run_directory / "run_info.json.tmp"
+    with open(tmp_file, "w") as f:
+        json.dump(info, f, indent=2)
+        f.write("\n")
+    os.replace(tmp_file, run_directory / "run_info.json")
 
 
 def setup_eirene_links(run_directory: Path):
