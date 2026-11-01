@@ -58,7 +58,7 @@ class SolpsRun(SimulationRun):
         self.job_state_since = launch_time
         self.attention_logged = False
         self.unknown_polls = 0
-        # set once the job has ended: "complete" or "crashed"
+        # set once the job has ended: "complete", "stalled" or "crashed"
         self.final_status = None
 
     def status(self) -> RunStatus:
@@ -162,11 +162,14 @@ class SolpsRun(SimulationRun):
     def check_ended(self) -> str:
         """
         The job has ended, so its output should all be there now. Returns
-        "crashed", "complete", or "continue" if the run ended cleanly but
-        hasn't converged.
+        "crashed", "complete", "stalled" if it hasn't converged after
+        max_continuations, or "continue" if the run ended cleanly but hasn't
+        converged.
         """
+        # the job's final Slurm state (from sacct), for the crash messages
+        ended_as = f"job {self.run_id} ended as {self.job_state}"
         if not isfile(self.directory / "balance.nc"):
-            self.log("crashed: the job ended without writing balance.nc")
+            self.log(f"crashed: the job ended without writing balance.nc ({ended_as})")
             return "crashed"
         try:
             ok_bool = subprocess.run(
@@ -184,15 +187,15 @@ class SolpsRun(SimulationRun):
         if ok_bool.returncode != 0:
             self.log(
                 f"crashed: b2fstate_OK_bool says b2fstate is bad "
-                f"(exit code {ok_bool.returncode})"
+                f"(exit code {ok_bool.returncode}; {ended_as})"
             )
             return "crashed"
 
         converged = check_convergence(self.directory, **self.convergence_settings)
         if converged is None:
             self.log(
-                "crashed: the job ended cleanly but its b2time.nc is missing "
-                "or unreadable, so convergence can't be judged"
+                f"crashed: the job ended cleanly but its b2time.nc is missing "
+                f"or unreadable, so convergence can't be judged ({ended_as})"
             )
             return "crashed"
         if converged:
@@ -205,7 +208,7 @@ class SolpsRun(SimulationRun):
                 f"stalled: not converged after {continuations} continuations; "
                 f"scored from its last balance.nc"
             )
-            return "complete"
+            return "stalled"
         return "continue"
 
     def continue_run(self):
