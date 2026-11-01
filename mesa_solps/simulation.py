@@ -191,14 +191,15 @@ def build_solps_case(
     case_directory: Path,
     parameter_dictionary: dict
 ):
+    # No fort.* files: setup_baserun_eirene_links makes fort.1 (a link to
+    # input.dat), and EIRENE starts fresh, as in a run folder set up by hand.
     input_files = [
         "input.dat",
-        "fort.1",
-        "fort.13",
         "b2.neutrals.parameters",
         "b2.boundary.parameters",
         "b2.numerics.parameters",
         "b2.transport.parameters",
+        "b2.user.parameters",
         "b2mn.dat"
     ]
 
