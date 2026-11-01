@@ -25,12 +25,15 @@ class SolpsRun(SimulationRun):
         directory: Path,
         launch_time: float,
         run_id: str,
+        convergence_settings: dict[str, float],
     ):
         self.parameters = parameters
         self.run_number = run_number
         self.directory = directory
         self.launch_time = launch_time
         self.run_id = run_id
+        # keyword arguments for check_convergence, from Solps
+        self.convergence_settings = convergence_settings
 
     def status(self) -> RunStatus:
         whoami = subprocess.run("whoami", capture_output=True, encoding="utf-8")
@@ -47,7 +50,7 @@ class SolpsRun(SimulationRun):
         if self.run_id not in job_ids:
             balance_created = isfile(self.directory / "balance.nc")
             status = "complete" if balance_created else "crashed"
-        elif check_convergence(self.directory, minimum_run_time=1e-3, window=2e-4):
+        elif check_convergence(self.directory, **self.convergence_settings):
             quit_file = self.directory / "b2mn.exe.dir/.quit"
             if not isfile(quit_file):
                 subprocess.run(["touch", quit_file], encoding="utf-8")
@@ -88,6 +91,9 @@ class Solps(Simulation):
         transport_profile_bounds: tuple[float, float],
         n_proc: int = 1,
         memory_gb: int = 20,
+        convergence_min_run_time: float = 1e-3,
+        convergence_window: float = 2e-4,
+        convergence_timescale: float = 1.0,
     ):
         # absolute, so it doesn't depend on the current directory
         self.reference_directory = Path(reference_directory).resolve()
@@ -97,6 +103,18 @@ class Solps(Simulation):
         check_transport_template(self.reference_directory / "b2.transport.inputfile")
         self.n_proc = n_proc
         self.memory = memory_gb
+
+        # convergence test (check_convergence), all in seconds of simulated time
+        if not convergence_window < convergence_min_run_time:
+            raise ValueError(
+                f"convergence_window ({convergence_window} s) must be shorter "
+                f"than convergence_min_run_time ({convergence_min_run_time} s)"
+            )
+        self.convergence_settings = {
+            "minimum_run_time": convergence_min_run_time,
+            "window": convergence_window,
+            "timescale": convergence_timescale,
+        }
 
     def launch(
         self,
@@ -179,6 +197,7 @@ class Solps(Simulation):
             run_number=run_number,
             parameters=parameters,
             launch_time=submit_time,
+            convergence_settings=self.convergence_settings,
         )
 
 
@@ -299,7 +318,14 @@ def setup_eirene_links(run_directory: Path):
         )
 
 
-def check_convergence(run_directory: Path, minimum_run_time: float, window: float) -> bool:
+def check_convergence(
+    run_directory: Path, minimum_run_time: float, window: float, timescale: float
+) -> bool:
+    """
+    The run is converged if it has run for at least minimum_run_time (s of
+    simulated time) and, over the last window (s), every monitored ne and Te
+    changes on a timescale longer than timescale (s).
+    """
     # A fresh run writes b2time.nc in b2mn.exe.dir while it runs; a restarted
     # run appends to the one in the run directory.
     time_file = run_directory / "b2mn.exe.dir" / "b2time.nc"
@@ -318,7 +344,6 @@ def check_convergence(run_directory: Path, minimum_run_time: float, window: floa
         logging.info(f"[solps_interface] could not read {time_file}: {error!r}")
         return False
 
-    assert minimum_run_time > window
     run_time = time.max() - time.min()
     if run_time < minimum_run_time:
         return False
@@ -335,5 +360,5 @@ def check_convergence(run_directory: Path, minimum_run_time: float, window: floa
     ne_timescales = 1 / abs(ne_gradients)
 
 
-    converged = (te_timescales > 1.0).all() and (ne_timescales > 1.0).all()
+    converged = (te_timescales > timescale).all() and (ne_timescales > timescale).all()
     return converged
