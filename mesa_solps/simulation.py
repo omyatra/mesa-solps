@@ -38,12 +38,15 @@ class SolpsRun(SimulationRun):
         whoami = subprocess.run("whoami", capture_output=True, encoding="utf-8")
         username = whoami.stdout.rstrip()
 
+        # job IDs only, one per line, no header
         squeue = subprocess.run(
-            ["squeue", "-u", username], capture_output=True, encoding="utf-8"
+            ["squeue", "-h", "-u", username, "-o", "%i"],
+            capture_output=True,
+            encoding="utf-8",
         )
-        job_queue = squeue.stdout
+        job_ids = set(squeue.stdout.split())
 
-        if self.run_id not in job_queue:
+        if self.run_id not in job_ids:
             balance_created = isfile(self.directory / "balance.nc")
             status = "complete" if balance_created else "crashed"
         elif (time() - self.launch_time) > self.timeout_hours * 3600.:
