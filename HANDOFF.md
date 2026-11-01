@@ -1,21 +1,24 @@
 # Handoff: mesa-solps
 
-## Current state: driver fixes, series A and B done
+## Current state: driver fixes, series A, B and C done
 
 Fixes to the SOLPS driver are being made from a commit plan kept outside this repo, as series of
 commits labelled A1, A2, ... (A: launching runs, B: polling, C: failures and results, D: logging,
-heartbeat and resume). **Series A (A1–A5) and B (B1–B7) are done. Series C (C1–C4) is next.**
+heartbeat and resume). **Series A (A1–A5), B (B1–B7) and C (C1–C5) are done. Series D is next.**
 Each commit message's "Tested:" section is still empty: it is filled in after the tests on the
 cluster.
 
 Branches (local, not pushed):
 
 - mesa-solps: `worktree-mesa-ab`
-- mesa: `mesa-ab` (three commits: one needed by A4, then B6 and B7)
+- mesa: `mesa-ab` (five commits: one needed by A4, then B6, B7, C1 and C2)
 
 **mesa-solps needs mesa from the `mesa-ab` branch.** From A4 on, `Solps.launch()` takes
-`iteration`, which only mesa `d484c39` and later pass. B6 (poll interval) and B7 (error handling)
-are engine changes the driver needs too. The `pyproject.toml` pin still points at `468c754`, so
+`iteration`, which only mesa `d484c39` and later pass. B6 (poll interval), B7 (error handling),
+C1 (safe evaluations file) and C2 (status column, `"stalled"`) are engine changes the driver needs
+too. From C4 on, the plug-in returns `"stalled"`, which an older engine doesn't know: the run
+would never leave its slot and the iteration would never end. The `pyproject.toml` pin still
+points at `468c754`, so
 `pip install .` alone installs a mesa that doesn't pass `iteration`, and the first launch fails
 with a TypeError (before anything is created or submitted). Until the pin moves (the last commit
 of the plan, after the mesa commits are pushed), install mesa from the `mesa-ab` branch as an
@@ -44,6 +47,11 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | B5    | mesa-solps | `27d4b18` | At the end of a healthy job: converged → complete; `b2time.nc` missing or unreadable → crashed (`check_convergence` returns `None` for "can't judge"); not converged → continued in `run_N/` (`b2fstati` → `b2fstati<k>`, `b2fstate` → `b2fstati`, `balance.nc` → `balance<k>.nc`, `b2mn.prt` removed, resubmitted, job appended to `run_info.json`). After `max_continuations` (new `Solps` setting, default 10, counted from `run_info.json`) the run is logged as stalled and returned as complete. `submit_job()` is shared by `launch()` and continuations. `SolpsRun`'s hash no longer includes the job ID. |
 | B6    | mesa | `2c5d1ba` | `launch_iteration`: each pass checks statuses, then fills free slots, then sleeps `poll_interval` (new setting, default 1800 s; no sleep after the iteration's last run). `poll_interval` is a `Mesa` argument and an optional input-file variable (`parse_input_module` only requires fields without a default). |
 | B7    | mesa | `df8d08b` | Error handling. `status()` raising: warning, run treated as running; after 3 in a row, "status check failing, needs attention". Scoring raising (`get_results` / objective): run counted as crashed, folder kept, other runs carry on. Anything else: `Mesa.run()` logs the traceback and the runs in flight (run number, folder), then re-raises; no job is cancelled. |
+| C1    | mesa | `5f2dd57` | The evaluations file is written to `<name>.tmp` in the same folder, then `os.replace`d onto it (helper `__write_evaluations_data`, used by the initialiser and after each run). The `astype` results are now kept, so the column types are applied. |
+| C2    | mesa | `2014bc3` | New `status` column; every finished run gets a row (helper `__add_evaluation`): `complete` / `stalled` scored, `crashed` / `timed-out` and scoring failures with a NaN objective. New run status `"stalled"`, handled like `"complete"`. No `rm -r`: crashed and timed-out folders are kept (timed-out still cancels first). `GPOptimizer.propose_evaluations` fits only rows with a score, and raises a clear error if fewer than 2 are left; the initial-sample count still counts every run. |
+| C3    | mesa-solps | `d74d919` | `cleanup()` keeps every file (no-op with a comment); the engine still calls it. |
+| C4    | mesa-solps | `dc560c8` | At the continuation cap, `status()` returns `"stalled"` (was `"complete"`). Each crash line in `check_ended()` ends with the job ID and its sacct State, e.g. "(job 1234 ended as NODE_FAIL)". |
+| C5    | mesa-solps | `6c54195` | At start-up (in `Solps.__init__`), `check_tools()` checks that `setup_baserun_eirene_links`, `itmsubmit`, `squeue`, `sacct` and `b2fstate_OK_bool` (`required_tools`) are on `PATH`, and raises an error listing the missing ones. |
 
 ### Changes from the plan
 
@@ -99,8 +107,33 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   caught. Also: the traceback for a failing status check is logged once per streak; the stop
   message is logged at error level and per-run problems at warning level; the loop moved
   unchanged into a private `__run()`, so `run()` has a single `try`.
+- **C1:** the message's "Why" was corrected: the missing `astype` was not harmless, since a new
+  file's columns were untyped (`object`) and an int fixed parameter was stored as `int64`. The
+  tmp file is named after the evaluations file (`<name>.tmp`), whatever its name. A failed write
+  leaves the tmp file behind; the next write overwrites it.
+- **C2:** decided while implementing: a run whose scoring fails (B7) also gets a `crashed` row,
+  which also keeps a later iteration from reusing a failed run's number (its folder is now kept,
+  so `run_N/` would already exist). The GP raises a clear error when fewer than 2 runs have a
+  score (it can't fit 0 or 1 points), rather than drawing more random points. The row-building
+  code moved unchanged into `__add_evaluation`, used by all four cases. `import subprocess` was
+  removed (only used by `rm -r`); the crash log line now says "folder kept". The `status` column
+  is written as `object` (pandas 3 reads it back as `str`).
+- **C3:** as planned. The message also names the files the old keep-list deleted that series A
+  and B added (`run_info.json`, `b2.user.parameters`, `b2fstati<k>`, `balance<k>.nc`).
+- **C4:** B4/B5 already logged a reason for every crash (including a third one, `b2time.nc`
+  missing or unreadable), and `change_state()` already logged the sacct state on the line
+  before. So the crash half only adds the job ID and sacct State to each crash line (decided:
+  kept, so each crash is explained in one line). Title changed to "give the Slurm state when a
+  run crashes". Only the first word of the sacct output is logged ("CANCELLED", not
+  "CANCELLED by <uid>").
+- **C5:** checked against the code: the driver also calls `whoami`, `touch` and `scancel`. Not
+  checked: the first two are standard system tools, and `scancel` is only reached through
+  `cancel()`, which the engine calls only for `"timed-out"` (no SOLPS run returns it since B2).
+  The check runs first in `Solps.__init__`, before the template check. Building a `Solps` now
+  needs the five tools on `PATH` (tests need placeholders).
+- No commits were added in series C.
 - Commit messages: where the plan names the cluster, the name was dropped ("checked on scratch
-  runs"), and plan labels are not referenced in commit messages.
+  runs", C3's disk sizes), and plan labels are not referenced in commit messages.
 
 ### Open questions
 
@@ -118,28 +151,39 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 - **A4 / B5, no submit-success check.** `itmsubmit`'s output is parsed for the job ID without
   checking it worked; a failed launch or continuation gets a junk ID, which B4 then reports as
   "unknown to squeue and sacct, needs attention" (deferred, as planned).
-- **A5:** `cleanup()`'s keep list doesn't include `b2.user.parameters`, so it is deleted from
-  scored runs until C3 makes `cleanup()` keep everything.
 - **B4, check on the cluster:** the real `squeue -o "%i %T %r"` and `sacct -o State%30` output
   (padding, other states such as `PREEMPTED` or `REQUEUED`); how long a job takes to appear in
   `sacct` after leaving `squeue`; that `b2fstate_OK_bool` checks `b2fstate` in the current
   directory when called with no arguments; the time limits (24 h, 1 h, 30 min).
-- **B4 / B7, missing `b2fstate_OK_bool` is retried, not a stop.** `status()` raises if
-  `run_info.json` is missing or broken at a state change, or if `b2fstate_OK_bool` is not on
-  `PATH`. B7 catches every `status()` error, so both are retried each poll (warning, then
-  needs-attention after 3) rather than stopping the driver, and the run holds its slot until the
-  cause is fixed. Proposed fix (not in the plan yet): check at start-up (in `Solps.__init__`) that
-  every outside tool the driver calls is on `PATH` (`setup_baserun_eirene_links`, `itmsubmit`,
-  `b2fstate_OK_bool`, `squeue`, `sacct`), as a small commit with series C.
-- **B5:** a continued run's intermediate files (`b2fstati<k>`, `balance<k>.nc`) are kept while it
-  runs, but `cleanup()` deletes them once the run is scored, until C3. A stalled run shows as
-  "complete" to the engine until C adds a "stalled" status. Check on the cluster that a
-  continuation restarts and appends to `run_N/b2time.nc` as in the hand-made restart.
+- **B4 / B7, broken `run_info.json` is retried, not a stop.** `status()` raises if
+  `run_info.json` is missing or broken at a state change; B7 catches every `status()` error, so
+  it is retried each poll (warning, then needs-attention after 3) and the run holds its slot
+  until it is fixed. Left as a per-run case (decided with C5). A tool missing at start-up now
+  stops the driver (C5); one that disappears while it runs is still retried this way.
+- **B5:** check on the cluster that a continuation restarts and appends to `run_N/b2time.nc` as
+  in the hand-made restart.
 - **B6:** the 1800 s default is SOLPS-scale; upstream may want a smaller default (it is a
   setting). The Himmelblau example (see above).
 - **B7:** catching every `status()` error could hide a real bug; the needs-attention line is the
-  guard, so watch for it in testing. A scoring failure gives no row in the evaluations file until
-  C2.
+  guard, so watch for it in testing.
+- **C2, crash loop (watch in testing):** a crashed point leaves the GP's data unchanged, so the GP
+  may propose the same point again. A penalty score is parked until after the first tests.
+- **C2, too few scored runs stops the driver.** If fewer than 2 runs have a score once the GP
+  phase starts (e.g. most of the initial runs crashed), `propose_evaluations` raises and the
+  driver stops. Intended (likely a set-up problem); raise in the mesa PR.
+- **C2, old evaluations files** without the `status` column don't match the new columns. Fine
+  while no real fits exist.
+- **C2, `GPOptimizer` bugs seen while testing, left alone (out of scope):** `gpo_search` fails
+  with exactly 1 free parameter (`reverse_normalisation`: "'numpy.float64' object is not
+  iterable"), before and after C2; SOLPS fits have several, so it doesn't affect them. The
+  initial-sample count `n_evals` is the highest run number, not the number of runs: run numbers
+  start at 0, so after 20 initial runs `n_evals` is 19 and one more random run is drawn before
+  the GP phase starts. Check with the mesa author.
+- **C3, disk use:** every file of every run is kept. Measure a real fit's disk use in testing,
+  then decide a keep-list (tarball vs loose files, `*.last10`, `2d_profiles/`, `fort.15` on
+  restart).
+- **C5:** `whoami`, `touch` and `scancel` are called but not checked (see "Changes from the
+  plan").
 - **Logging until D1:** `import mesa` calls `logging.basicConfig(level=INFO)`, so all log lines go
   to stderr, without timestamps; the second `basicConfig` call in `mesa/__init__.py` (to
   `runlog.log`) does nothing, and `core.logger_setup()` is never called. D1 (log to a file)
@@ -153,11 +197,12 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 ### What was tested
 
 Only imports, pure functions and temp dirs; nothing that calls Slurm, and `Solps.launch()` was
-not run. For B1, B2, B4 and B5, `SolpsRun.status()` was run on runs in temp dirs, with fake
+not run. For B1, B2, B4, B5 and C4, `SolpsRun.status()` was run on runs in temp dirs, with fake
 `squeue`, `sacct`, `b2fstate_OK_bool` and `itmsubmit` scripts first on a restricted `PATH`
-(checked to resolve to the fakes or to nothing; there was no `scancel`, real or fake). B6 and B7
-used an in-memory fake simulation with `sleep` replaced. Throwaway test scripts were kept
-outside the repo.
+(checked to resolve to the fakes or to nothing; there was no `scancel`, real or fake). C3 called
+`SolpsRun.cleanup()` on a run in a temp dir, and C5 built `Solps` with placeholder tools on such
+a `PATH`. B6, B7, C1 and C2 used an in-memory fake simulation with `sleep` replaced. Throwaway
+test scripts were kept outside the repo.
 
 - A1: `check_convergence` on synthetic `b2time.nc` files: missing, corrupt (logged), converged
   in `run_N/`, drifting in `b2mn.exe.dir/` (preferred), run shorter than the minimum.
@@ -206,6 +251,30 @@ outside the repo.
   (crashed, folder kept, other runs scored); the evaluations file, a launch and the optimiser
   failing (traceback and in-flight list logged, original error re-raised); Ctrl-C passing
   through; a normal run unaffected; B6 rerun.
+- C1: a new evaluations file is empty with the right types; after an iteration of 3 runs, 3 rows
+  with the right types (an int fixed parameter stored as `float64`); no tmp file left; a write
+  that fails mid-way (`to_hdf` writing half a file, then "Disk quota exceeded") leaves the old
+  file intact and readable, and the next write succeeds; an existing file is not re-initialised.
+- C2: one iteration with runs ending complete, stalled, crashed, timed-out and complete with a
+  failing `get_results`: a row each with the right status, scores for complete and stalled
+  only, NaN otherwise, parameters recorded for all; every folder kept with its files;
+  `cleanup()` for complete and stalled only, `cancel()` for timed-out only; the next run number
+  and iteration count every run. GP: only scored rows reach `gpo_search` (caller's table
+  unchanged); 0 or 1 scored of 5 raise the clear error; the initial phase still counts crashed
+  runs; a real GP fit on 4 scored of 6 rows (gaps in the run numbers, 2 free parameters)
+  proposes a point in bounds. B6 rerun passes; B7 rerun: only its "no row for a scoring failure"
+  checks fail, as intended.
+- C3: `cleanup()` on a run folder with 13 files (state files, continuation files,
+  `run_info.json`, `b2.user.parameters`, logs, a subfolder) leaves every file unchanged.
+- C4: at the cap (2 of 2) → `"stalled"`, logged, not continued, kept on later polls with no
+  tool called; `max_continuations=0` → stalled; below the cap still continued; converged at the
+  cap → complete. Crash lines end with "(job 4242 ended as <State>)" for no `balance.nc` with
+  FAILED, `CANCELLED by <uid>`, NODE_FAIL, OUT_OF_MEMORY; for `b2fstate_OK_bool` exiting 3; for
+  no `b2time.nc`. B4 / B5 reruns: only the expected checks fail (the cap now stalled; healthy
+  ends with no `b2time.nc` crashed, as after B5).
+- C5: all tools present → `Solps` builds; each tool missing alone → error naming only it; two
+  missing → both listed in order; all missing with a bad reference → the tool error comes
+  first; a non-executable tool counts as missing; nothing created.
 - Imports of all `mesa_solps` modules, with mesa from the `mesa-ab` branch.
 
 ## Packaging (earlier work)
@@ -239,6 +308,8 @@ Fixes waiting to go upstream:
    not pushed yet). See "Current state" above.
 3. **mesa: poll interval and error handling** (`2c5d1ba`, `df8d08b`, branch `mesa-ab`, not
    pushed yet). See "Current state" above.
+4. **mesa: safe evaluations file; a row for every run** (`5f2dd57`, `2014bc3`, branch
+   `mesa-ab`, not pushed yet). See "Current state" above.
 
 ### Pins and why
 
