@@ -17,6 +17,19 @@ from .models import linear_transport_profile, profile_radius_axis
 from .parameters import conductivity_profile, diffusivity_profile, required_parameters
 
 
+# Slurm job states (sacct) after which the job will not run again
+ended_job_states = {
+    "COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"
+}
+
+# How long a run can stay in one state before the log says it needs attention
+# (starting values, to tune in testing). The run is never cancelled for it.
+pending_attention_hours = 24.0  # PENDING
+no_time_file_attention_hours = 1.0  # RUNNING without a b2time.nc
+completing_attention_hours = 0.5  # COMPLETING
+unknown_attention_polls = 3  # polls in a row unknown to both squeue and sacct
+
+
 class SolpsRun(SimulationRun):
     def __init__(
         self,
@@ -35,29 +48,162 @@ class SolpsRun(SimulationRun):
         # keyword arguments for check_convergence, from Solps
         self.convergence_settings = convergence_settings
 
+        # Slurm state of the job as last seen, and since when (driver's clock)
+        self.job_state = "PENDING"
+        self.job_state_since = launch_time
+        self.attention_logged = False
+        self.unknown_polls = 0
+        # set once the job has ended: "complete" or "crashed"
+        self.final_status = None
+
     def status(self) -> RunStatus:
+        """
+        Checks the run once per poll, only for what makes sense in the job's
+        Slurm state. Nothing is decided about the run's result until Slurm
+        confirms that the job has ended.
+        """
+        if self.final_status is not None:
+            return self.final_status
+
         whoami = subprocess.run("whoami", capture_output=True, encoding="utf-8")
         username = whoami.stdout.rstrip()
 
-        # job IDs only, one per line, no header
+        # job ID, state and reason, one job per line, no header
         squeue = subprocess.run(
-            ["squeue", "-h", "-u", username, "-o", "%i"],
+            ["squeue", "-h", "-u", username, "-o", "%i %T %r"],
             capture_output=True,
             encoding="utf-8",
         )
-        job_ids = set(squeue.stdout.split())
+        if squeue.returncode != 0:
+            self.log(
+                f"squeue failed (exit code {squeue.returncode}), status "
+                f"decided next poll: {squeue.stderr.strip()}"
+            )
+            return "running"
 
-        if self.run_id not in job_ids:
-            balance_created = isfile(self.directory / "balance.nc")
-            status = "complete" if balance_created else "crashed"
+        jobs = {}
+        for line in squeue.stdout.splitlines():
+            fields = line.split(maxsplit=2)
+            if len(fields) >= 2:
+                jobs[fields[0]] = (fields[1], fields[2] if len(fields) > 2 else "")
+
+        if self.run_id in jobs:
+            self.unknown_polls = 0
+            state, reason = jobs[self.run_id]
+            self.change_state(state)
+            if state == "PENDING":
+                self.attention_after(
+                    pending_attention_hours,
+                    f"pending since {timestamp(self.job_state_since)} ({reason})",
+                )
+            elif state == "RUNNING":
+                self.check_running()
+            elif state == "COMPLETING":
+                self.attention_after(
+                    completing_attention_hours,
+                    f"completing since {timestamp(self.job_state_since)}",
+                )
+            # any other state (e.g. CONFIGURING, SUSPENDED): wait, no checks
+            return "running"
+
+        # not listed: ask sacct whether the job has ended
+        sacct = subprocess.run(
+            ["sacct", "-j", self.run_id, "-n", "-X", "-o", "State%30"],
+            capture_output=True,
+            encoding="utf-8",
+        )
+        if sacct.returncode != 0:
+            self.log(
+                f"job {self.run_id} not in squeue and sacct failed (exit code "
+                f"{sacct.returncode}), status decided next poll: {sacct.stderr.strip()}"
+            )
+            return "running"
+
+        words = sacct.stdout.split()  # e.g. "CANCELLED by 12345"
+        sacct_state = words[0] if words else None
+        if sacct_state is None:
+            self.unknown_polls += 1
+            if self.unknown_polls == unknown_attention_polls:
+                self.log(
+                    f"job {self.run_id} unknown to squeue and sacct, needs attention"
+                )
+            return "running"
+        self.unknown_polls = 0
+        if sacct_state not in ended_job_states:
+            # e.g. sacct still says RUNNING just after the job left squeue
+            return "running"
+
+        self.change_state(sacct_state)
+        self.final_status = self.check_ended()
+        return self.final_status
+
+    def check_running(self):
+        time_file = find_time_file(self.directory)
+        if time_file is None:
+            # normal at first: SOLPS writes the first record a few minutes in
+            self.attention_after(
+                no_time_file_attention_hours,
+                f"running since {timestamp(self.job_state_since)} with no b2time.nc",
+            )
         elif check_convergence(self.directory, **self.convergence_settings):
             quit_file = self.directory / "b2mn.exe.dir/.quit"
             if not isfile(quit_file):
                 subprocess.run(["touch", quit_file], encoding="utf-8")
-            status = "running"
-        else:
-            status = "running"
-        return status
+
+    def check_ended(self) -> RunStatus:
+        """The job has ended, so its output should all be there now."""
+        if not isfile(self.directory / "balance.nc"):
+            self.log("crashed: the job ended without writing balance.nc")
+            return "crashed"
+        try:
+            ok_bool = subprocess.run(
+                ["b2fstate_OK_bool"],
+                cwd=self.directory,
+                capture_output=True,
+                encoding="utf-8",
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"b2fstate_OK_bool not found on PATH, so {self.directory} "
+                f"can't be checked; run the driver in a shell with SOLPS-ITER's "
+                f"setup.csh sourced"
+            )
+        if ok_bool.returncode != 0:
+            self.log(
+                f"crashed: b2fstate_OK_bool says b2fstate is bad "
+                f"(exit code {ok_bool.returncode})"
+            )
+            return "crashed"
+        return "complete"
+
+    def change_state(self, state: str):
+        """Logs a change of the job's Slurm state and records it in run_info.json."""
+        if state == self.job_state:
+            return
+        now = time()
+        self.log(
+            f"{self.job_state} -> {state} after "
+            f"{duration(now - self.job_state_since)}"
+        )
+        if state == "RUNNING" or state in ended_job_states:
+            key = "started" if state == "RUNNING" else "ended"
+            info = read_run_info(self.directory)
+            for job in info["jobs"]:
+                if job["job_id"] == self.run_id and key not in job:
+                    job[key] = timestamp(now)
+            write_run_info(self.directory, info)
+        self.job_state = state
+        self.job_state_since = now
+        self.attention_logged = False
+
+    def attention_after(self, hours: float, message: str):
+        """Logs message once if the job has been in its state for over hours."""
+        if not self.attention_logged and time() - self.job_state_since > hours * 3600.:
+            self.log(f"{message}, needs attention")
+            self.attention_logged = True
+
+    def log(self, message: str):
+        logging.info(f"[solps_interface] run {self.run_number}: {message}")
 
     def cleanup(self):
         output_files = [f for f in os.listdir(self.directory) if isfile(self.directory / f)]
@@ -275,6 +421,13 @@ def timestamp(t: float) -> str:
     return datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
 
 
+def duration(seconds: float) -> str:
+    """e.g. "1 h 40 min", "25 min"."""
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min" if hours else f"{minutes} min"
+
+
 def write_run_info(run_directory: Path, info: dict):
     """
     Writes run_directory/run_info.json: the run number, iteration, parameters
@@ -286,6 +439,11 @@ def write_run_info(run_directory: Path, info: dict):
         json.dump(info, f, indent=2)
         f.write("\n")
     os.replace(tmp_file, run_directory / "run_info.json")
+
+
+def read_run_info(run_directory: Path) -> dict:
+    with open(run_directory / "run_info.json") as f:
+        return json.load(f)
 
 
 def setup_eirene_links(run_directory: Path):
@@ -318,6 +476,16 @@ def setup_eirene_links(run_directory: Path):
         )
 
 
+def find_time_file(run_directory: Path) -> Path | None:
+    """The run's b2time.nc, or None if there is none yet."""
+    # A fresh run writes b2time.nc in b2mn.exe.dir while it runs; a restarted
+    # run appends to the one in the run directory.
+    for time_file in (run_directory / "b2mn.exe.dir" / "b2time.nc", run_directory / "b2time.nc"):
+        if isfile(time_file):
+            return time_file
+    return None
+
+
 def check_convergence(
     run_directory: Path, minimum_run_time: float, window: float, timescale: float
 ) -> bool:
@@ -326,12 +494,8 @@ def check_convergence(
     simulated time) and, over the last window (s), every monitored ne and Te
     changes on a timescale longer than timescale (s).
     """
-    # A fresh run writes b2time.nc in b2mn.exe.dir while it runs; a restarted
-    # run appends to the one in the run directory.
-    time_file = run_directory / "b2mn.exe.dir" / "b2time.nc"
-    if not isfile(time_file):
-        time_file = run_directory / "b2time.nc"
-    if not isfile(time_file):
+    time_file = find_time_file(run_directory)
+    if time_file is None:
         return False
 
     try:
