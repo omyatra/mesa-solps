@@ -34,17 +34,23 @@ Then five more mesa commits fix problems found in a dry run of the driver with f
 What the review of that dry run found about proposals per iteration and what `max_iterations`
 counts is in "Open questions".
 
-**Next:** push the mesa branch, then move the mesa pin in `pyproject.toml` to its last commit
-(`c8b5799`; this pin move is the last commit of the plan), then the cluster tests (see "What the
-cluster tests must check" below),
-then fill in the "Tested:" sections. Before the main mesa test, decide when logging starts (see
-"Open questions": start-up warnings and errors don't reach `mesa.log`).
+One more mesa commit (`6d6c8cd`, last row of "Commits") fixes the initial-sample count in
+`GPOptimizer`: it counted the highest run number, which starts at 0, so after N initial runs one
+more random run was drawn and iteration 1 was a 1-run random top-up. It now counts the rows of the
+evaluations data, so iteration 1 is the first GP proposal.
+
+**Next:** push the mesa branch, then the cluster tests with mesa installed from the `mesa-ab`
+branch (see below and "What the cluster tests must check"), then fill in the "Tested:" sections.
+The mesa pin in `pyproject.toml` stays where it is until full testing is done; only then does it
+move to the last mesa commit (this pin move is the last commit of the plan). Before the main mesa
+test, decide when logging starts (see "Open questions": start-up warnings and errors don't reach
+`mesa.log`).
 
 Branches (local, not pushed):
 
 - mesa-solps: `worktree-mesa-ab`
-- mesa: `mesa-ab` (13 commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3, then five
-  from the dry run)
+- mesa: `mesa-ab` (14 commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3, then five
+  from the dry run, then the initial-sample count fix)
 
 **mesa-solps needs mesa from the `mesa-ab` branch.** From A4 on, `Solps.launch()` takes
 `iteration`, which only mesa `d484c39` and later pass. B6 (poll interval), B7 (error handling),
@@ -55,7 +61,7 @@ would never leave its slot and the iteration would never end. D4's adoption hook
 points at `468c754`, so
 `pip install .` alone installs a mesa that doesn't pass `iteration`, and the first launch fails
 with a TypeError (before anything is created or submitted). Until the pin moves (the last commit
-of the plan, after the mesa commits are pushed), install mesa from the `mesa-ab` branch as an
+of the plan, after full testing is done), install mesa from the `mesa-ab` branch as an
 editable install after installing mesa-solps:
 
 ```
@@ -99,6 +105,7 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | –     | mesa | `6931ecd` | All scores equal (zero spread) among the runs the GP fits: `ValueError` before the fit, giving the number of runs, the shared value and the likely cause (the runs gave the same output), instead of the NaN error from inside `inference.gp`. |
 | –     | mesa | `1c1da0f` | Docstring on `Mesa.__init__`: `max_iterations` is the last iteration number to run; iterations count from 0 (iteration 0 is the initial random batch with `GPOptimizer`), so up to `max_iterations + 1` are run. No code change. |
 | –     | mesa | `c8b5799` | Ctrl-C: `run()` catches `KeyboardInterrupt`, marks the heartbeat stopped as before, logs "interrupted (Ctrl-C), heartbeat marked stopped; runs in flight not cancelled" (or "not marked stopped (see above)") and exits with `SystemExit(130)`, no traceback. The "another driver may be running" refusal adds "or wait 2 x poll_interval (N s) after the last-seen time and restart". New-parameter log lines in `core.py` and `gpo.py` print plain numbers, not `np.float64(...)`. |
+| –     | mesa | `6d6c8cd` | `GPOptimizer.propose_evaluations` counts the runs so far as the number of rows in the evaluations data (was the highest run number, one less than the count since run numbers start at 0). Every run still counts towards the initial sample (complete, stalled, crashed, timed-out, adopted). With `initial_sample_count=N`, iteration 0 has N random runs and iteration 1 is a GP proposal (was a 1-run random top-up). A run folder that can't be adopted has no row and is no longer counted. |
 
 ### Changes from the plan
 
@@ -237,6 +244,10 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
     would run the input file's code after `mesa.run()`). Added while implementing: the message says
     whether the heartbeat was really marked stopped (`__mark_heartbeat_stopped` returns a bool) and
     that runs in flight are not cancelled. No `np.float64(...)` log lines were found in mesa-solps.
+- **Added mesa commit after the dry run** (not in the plan): `6d6c8cd` (initial-sample count),
+  agreed before it was written. Only `gpo.py` used the highest run number as a count; the other
+  uses (`core.py`'s next run number and iteration numbers, `genetic.py`'s iteration check, the
+  Himmelblau plot) are not counts and were left alone.
 - Commit messages: where the plan names the cluster, the name was dropped ("checked on scratch
   runs", C3's disk sizes), and plan labels are not referenced in commit messages.
 
@@ -282,11 +293,9 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 - **C2, `GPOptimizer` bugs seen while testing, left alone (out of scope):** `gpo_search` fails
   with exactly 1 free parameter (`reverse_normalisation`: "'numpy.float64' object is not
   iterable"), before and after C2; SOLPS fits have several, so it doesn't affect them. The
-  initial-sample count `n_evals` is the highest run number, not the number of runs: run numbers
-  start at 0, so after 20 initial runs `n_evals` is 19 and one more random run is drawn before
-  the GP phase starts. Check with the mesa author. D3 doesn't depend on `n_evals` and doesn't
-  change it, but folders that can't be adopted leave gaps in the run numbers, and each gap below
-  the highest number counts as an initial sample that never ran.
+  initial-sample count `n_evals` was the highest run number, not the number of runs (one random
+  run too many); fixed in `6d6c8cd`, which counts rows, so folders that can't be adopted (no row)
+  no longer count as initial samples either.
 - **C3, disk use:** every file of every run is kept. Measure a real fit's disk use in testing,
   then decide a keep-list (tarball vs loose files, `*.last10`, `2d_profiles/`, `fort.15` on
   restart).
@@ -301,8 +310,8 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   plug-ins; to raise in the mesa PR.
 - **Proposals per iteration (left out for now):** with `GPOptimizer`, only the initial random
   batch (iteration 0) fills the `max_concurrent_runs` slots. There is no batch-size setting.
-  - Iteration 1 is a 1-point random top-up. This is the `n_evals` off-by-one above: run numbers
-    start at 0, so after N initial runs `n_evals` is N−1.
+  - Iteration 1 used to be a 1-point random top-up (the `n_evals` off-by-one above); since
+    `6d6c8cd` it is the first GP proposal.
   - Each GP iteration proposes one point by design (one fit, one acquisition maximum), and the
     next iteration only starts once all of the current one's runs have finished. So in the GP
     phase one slot is used and the others stay empty.
@@ -314,8 +323,8 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
     with less information, so a fit usually needs more runs in total.
 - **What `max_iterations` counts:** the last iteration number run. Iterations count from 0, and
   iteration 0 is the initial random batch with `GPOptimizer`, so up to `max_iterations + 1`
-  iterations are run (documented in `1c1da0f`). With the `n_evals` top-up taking iteration 1,
-  `max_iterations=2` gives a single GP iteration. The genetic strategy's check
+  iterations are run (documented in `1c1da0f`). Since `6d6c8cd` (no random top-up),
+  `max_iterations=2` gives two GP iterations (1 and 2). The genetic strategy's check
   (`df.index[-1][0] >= max_iterations`, on the last recorded iteration) means the same, but
   `GeneticOptimizer` is left over from an older API and can't be instantiated (no
   `propose_evaluations`).
@@ -529,6 +538,16 @@ Throwaway test scripts were kept outside the repo.
     - The refusal message names 2 x `poll_interval` in seconds (3600 s for 1800).
     - The new-parameter log lines print plain numbers (`np.float64(...)` before).
     - The earlier tests rerun and pass.
+- `6d6c8cd` (initial-sample count), `initial_sample_count` 4, 2 free parameters:
+  - `propose_evaluations` on toy tables, against the code before the change: empty → 4 random
+    (both); 3 rows → 1 random (2 before); 4 rows with a crashed (NaN) and a stalled row → a GP
+    fit on the 2 usable rows, point in bounds (1 random before). The caller's table is unchanged.
+  - `Mesa.run()` with the toy plug-in (4 slots, `max_iterations` 2, `poll_interval` 0, run 1
+    crashed, run 2 stalled): iteration 0 has 4 random runs, iterations 1 and 2 one GP proposal
+    each (4 + 1 + 1). Before the change, iteration 1 was a random top-up and only iteration 2 a
+    GP proposal.
+  - Ctrl-C with runs 0 and 1 recorded and 2 and 3 in flight: the restart adopts 2 and 3,
+    finishes iteration 0, and iteration 1 is a GP proposal (4 + 1 + 1).
 
 ### What the cluster tests must check
 
@@ -578,6 +597,8 @@ Gathered from all series; none of this could be tested here.
 - **Stalled runs (`9dae4d3`):** a stalled run shows in the evaluations file (status `stalled`,
   with its score) but not in the GP fit. The fit logs no row count, so check this offline: the
   rows the GP fits are those with a score and a status other than `stalled`.
+- **Initial sample (`6d6c8cd`):** with `initial_sample_count=N`, iteration 0 has N random runs
+  and iteration 1 is a GP proposal ("New parameters:" from the GP in `mesa.log`, one run).
 - **Tools at start-up (C5):** the driver starts in a shell with SOLPS-ITER's `setup.csh` sourced
   and stops with the list of missing tools otherwise.
 
