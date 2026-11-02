@@ -324,6 +324,12 @@ class Solps(Simulation):
         check_tools()
         # absolute, so it doesn't depend on the current directory
         self.reference_directory = Path(reference_directory).resolve()
+        # stop now if there is no plasma state to start the runs from
+        if reference_state_file(self.reference_directory) is None:
+            raise FileNotFoundError(
+                f"no b2fstate or b2fstati in the reference folder "
+                f"{self.reference_directory}, so runs can't be started from it"
+            )
         self.transport_bounds = transport_profile_bounds
         # stop now, before anything is submitted, if the reference
         # b2.transport.inputfile can't be used as a template
@@ -513,7 +519,12 @@ def build_solps_case(
 
     # create the case directory and copy all the reference files
     case_directory.mkdir()
-    sh.copy(reference_directory / "b2fstate", case_directory / "b2fstati")
+    state_file = reference_state_file(reference_directory)
+    sh.copy(state_file, case_directory / "b2fstati")
+    logging.info(
+        f"[solps_interface] {case_directory.name}: b2fstati copied from the "
+        f"reference's {state_file.name}"
+    )
     for input in input_files:
         if isfile(reference_directory / input):
             sh.copy(reference_directory / input, case_directory / input)
@@ -561,6 +572,17 @@ def build_solps_case(
                 \r>> but were not found in any input files with a .mesa extension.
                 """
             )
+
+
+def reference_state_file(reference_directory: Path) -> Path | None:
+    """
+    The reference's plasma state that runs start from: its b2fstate (its end
+    state) if there is one, else its b2fstati (its start state), else None.
+    """
+    for name in ("b2fstate", "b2fstati"):
+        if isfile(reference_directory / name):
+            return reference_directory / name
+    return None
 
 
 def timestamp(t: float) -> str:
