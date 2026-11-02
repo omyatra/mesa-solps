@@ -1,6 +1,6 @@
 # Handoff: mesa-solps
 
-## Current state: driver fixes, series A, B, C and D done, plus three fixes from the cluster checks
+## Current state: driver fixes, series A, B, C and D done, plus fixes from the cluster checks and a dry run
 
 Fixes to the SOLPS driver are being made from a commit plan kept outside this repo, as series of
 commits labelled A1, A2, ... (A: launching runs, B: polling, C: failures and results, D: logging,
@@ -21,15 +21,30 @@ run's `b2mn.dat`. The convergence settings changed names:
 
 `convergence_window` and `convergence_min_run_time` are gone (passing them is a `TypeError`).
 
-**Next:** push the mesa branch, then move the mesa pin in `pyproject.toml` to its last commit (the
-last commit of the plan), then the cluster tests (see "What the cluster tests must check" below),
+Then five more mesa commits fix problems found in a dry run of the driver with fake Slurm tools
+(every driver path ran; nothing was submitted). They are the last five rows of "Commits":
+
+- After a restart, the interrupted iteration carries on under its own number (`iteration.json`
+  in the case folder).
+- Stalled runs are left out of the GP fit.
+- All-equal scores stop the driver with a clear error.
+- `max_iterations` is documented.
+- Short Ctrl-C message, clearer refusal message, plain numbers in the logs.
+
+What the review of that dry run found about proposals per iteration and what `max_iterations`
+counts is in "Open questions".
+
+**Next:** push the mesa branch, then move the mesa pin in `pyproject.toml` to its last commit
+(`c8b5799`; this pin move is the last commit of the plan), then the cluster tests (see "What the
+cluster tests must check" below),
 then fill in the "Tested:" sections. Before the main mesa test, decide when logging starts (see
 "Open questions": start-up warnings and errors don't reach `mesa.log`).
 
 Branches (local, not pushed):
 
 - mesa-solps: `worktree-mesa-ab`
-- mesa: `mesa-ab` (eight commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3)
+- mesa: `mesa-ab` (13 commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3, then five
+  from the dry run)
 
 **mesa-solps needs mesa from the `mesa-ab` branch.** From A4 on, `Solps.launch()` takes
 `iteration`, which only mesa `d484c39` and later pass. B6 (poll interval), B7 (error handling),
@@ -79,6 +94,11 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | –     | mesa-solps | `5d89426` | `build_solps_case` copies the reference's `b2fstate` to `run_N/b2fstati`, else its `b2fstati` (new helper `reference_state_file()`), and logs which one. Neither: an error naming the folder at start-up (in `Solps.__init__`, after `check_tools()`). |
 | –     | mesa-solps | `2b70784` | Convergence window counted in `b2time.nc` points (one saved time each, written every `b2mndr_b2time` iterations), replacing B3's times: `convergence_window_points` (25, floor 5, `int` only, else `TypeError`) and `convergence_min_run_factor` (3, floor 2; minimum run = ceil(factor × window) points); `convergence_timescale` unchanged. A value below its floor is raised to it with one warning at start-up (replaces B3's `ValueError`). `check_convergence`: fewer points than the minimum → not converged; else fit the last `window_points` points against `timesa`; `timesa` not strictly increasing in the window → warning, test still applied. Points counted over the whole file. `example_input.py` passes the three settings at their defaults. |
 | –     | mesa-solps | `1ef403c` | `b2mndr_stim` in `b2mn.dat`: `build_solps_case` sets it to `'0'` (new `b2time.nc`, time from 0), `continue_run` to `'-1'` before resubmitting (appends). New helper `set_b2mn_value()`: sets one key, keeps the rest of the file byte for byte, adds the key at the end if it is missing. |
+| –     | mesa | `4ac188c` | Resume the interrupted iteration: `launch_iteration` keeps the iteration's points not launched yet in `iteration.json` in the simulations directory (tmp file + rename, rewritten after each launch). At start-up, after the adopted runs have finished, `__resume_iteration` launches them under the same iteration number (new run numbers), then the driver carries on with the next iteration, so a driver stop no longer uses up one of `max_iterations`. An unreadable file, one for another iteration than the last recorded one (or the one after), or one with other parameter names is logged and ignored. Run-number calculation moved unchanged into `__next_run_number`. |
+| –     | mesa | `9dae4d3` | Stalled runs are left out of the GP fit (`GPOptimizer.propose_evaluations`, next to the crashed-run filter); they keep their score and `stalled` row in the evaluations file and still count towards the initial sample count. The "fewer than 2" error says "usable score (stalled runs excluded)". `RunStatus` comment in `simulations.py` updated. |
+| –     | mesa | `6931ecd` | All scores equal (zero spread) among the runs the GP fits: `ValueError` before the fit, giving the number of runs, the shared value and the likely cause (the runs gave the same output), instead of the NaN error from inside `inference.gp`. |
+| –     | mesa | `1c1da0f` | Docstring on `Mesa.__init__`: `max_iterations` is the last iteration number to run; iterations count from 0 (iteration 0 is the initial random batch with `GPOptimizer`), so up to `max_iterations + 1` are run. No code change. |
+| –     | mesa | `c8b5799` | Ctrl-C: `run()` catches `KeyboardInterrupt`, marks the heartbeat stopped as before, logs "interrupted (Ctrl-C), heartbeat marked stopped; runs in flight not cancelled" (or "not marked stopped (see above)") and exits with `SystemExit(130)`, no traceback. The "another driver may be running" refusal adds "or wait 2 x poll_interval (N s) after the last-seen time and restart". New-parameter log lines in `core.py` and `gpo.py` print plain numbers, not `np.float64(...)`. |
 
 ### Changes from the plan
 
@@ -200,6 +220,23 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   - `1ef403c` (`b2mndr_stim`): a reference with no `b2mn.dat` still gives a run with none (as
     before); `continue_run` raises if `run_N/b2mn.dat` is missing. Lines that don't start with the
     quoted key (e.g. comments) are left alone.
+- **Added mesa commits after series D** (not in the plan), from a dry run with fake Slurm tools.
+  Each was agreed before it was written, and committed one at a time:
+  - `4ac188c` (resume): of three options (save the unlaunched points; reuse the adopted runs'
+    iteration number; keep the behaviour and log "budget reduced by 1"), saving the points was
+    chosen. Reusing the number would give a finished GP iteration a second point. Decided: the
+    leftover points get new run numbers and are launched after the adopted runs have finished, not
+    alongside them; the file is rewritten after each launch, so a stop in between launches that
+    point twice rather than losing it.
+  - `9dae4d3` (stalled runs): filtered in `GPOptimizer` (decided), not in the engine, so that they
+    still count towards the initial sample and other strategies still see them.
+  - `6931ecd` (equal scores): no fallback; inference-tools untouched.
+  - `1c1da0f` (`max_iterations`): docstring only (decided); not a bug, as the same `>` check was in
+    the code before the framework refactor.
+  - `c8b5799` (cosmetics): decided: `SystemExit(130)` after Ctrl-C (not returning normally, which
+    would run the input file's code after `mesa.run()`). Added while implementing: the message says
+    whether the heartbeat was really marked stopped (`__mark_heartbeat_stopped` returns a bool) and
+    that runs in flight are not cancelled. No `np.float64(...)` log lines were found in mesa-solps.
 - Commit messages: where the plan names the cluster, the name was dropped ("checked on scratch
   runs", C3's disk sizes), and plan labels are not referenced in commit messages.
 
@@ -262,6 +299,31 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 - **D2 / D3, engine API additions:** optional `SimulationRun.job_id` and `SimulationRun.iteration`,
   optional `Simulation.existing_run_numbers()` and `Simulation.adopt()`. No change for existing
   plug-ins; to raise in the mesa PR.
+- **Proposals per iteration (left out for now):** with `GPOptimizer`, only the initial random
+  batch (iteration 0) fills the `max_concurrent_runs` slots. There is no batch-size setting.
+  - Iteration 1 is a 1-point random top-up. This is the `n_evals` off-by-one above: run numbers
+    start at 0, so after N initial runs `n_evals` is N−1.
+  - Each GP iteration proposes one point by design (one fit, one acquisition maximum), and the
+    next iteration only starts once all of the current one's runs have finished. So in the GP
+    phase one slot is used and the others stay empty.
+  - To fill them, the GP would propose a batch per fit ("kriging believer": add each proposed
+    point with its predicted score, refit, propose again; `GpOptimiser.add_evaluation` exists),
+    about 20–30 lines in `gpo.py` plus a batch-size setting. An iteration would then count
+    batches. Proposing asynchronously as slots free up is the bigger alternative.
+  - Trade-off: a batch uses the slots (less wall-clock time per fit), but each point is chosen
+    with less information, so a fit usually needs more runs in total.
+- **What `max_iterations` counts:** the last iteration number run. Iterations count from 0, and
+  iteration 0 is the initial random batch with `GPOptimizer`, so up to `max_iterations + 1`
+  iterations are run (documented in `1c1da0f`). With the `n_evals` top-up taking iteration 1,
+  `max_iterations=2` gives a single GP iteration. The genetic strategy's check
+  (`df.index[-1][0] >= max_iterations`, on the last recorded iteration) means the same, but
+  `GeneticOptimizer` is left over from an older API and can't be instantiated (no
+  `propose_evaluations`).
+- **`4ac188c`, resume windows:** a driver stopped between a `launch()` and the rewrite of
+  `iteration.json` launches that point again on restart (one extra run). While the adopted runs
+  finish, the free slots stay empty; the leftover points start only afterwards.
+- **Engine changes to raise in the mesa PR (dry-run commits):** the new `iteration.json` state
+  file; Ctrl-C now ends `run()` with `SystemExit(130)`, not `KeyboardInterrupt`.
 - **D4, short windows a restart doesn't handle:** a driver killed inside a continuation, after
   the renames but before the new job is recorded, leaves a run that is judged "crashed" when
   adopted (`balance.nc` already renamed); a driver killed between `itmsubmit` and writing
@@ -426,6 +488,47 @@ Throwaway test scripts were kept outside the repo.
   end; CRLF endings kept; an unquoted value replaced; no `b2mn.dat` in the reference → none made.
   The earlier two fixes' tests rerun and pass.
 - Imports of all `mesa_solps` modules, with mesa from the `mesa-ab` branch.
+- Dry-run commits (`4ac188c` to `c8b5799`). The setup:
+  - A toy plug-in in Python that keeps each run's state in its folder, so runs survive a killed
+    driver. A run is complete after 2 status checks.
+  - Strategies: a toy one (5 points in iteration 0, then 1) and the real `GPOptimizer`.
+  - Each driver ran in its own process, with 2 slots and `poll_interval` 0 (no sleeping).
+    "kill -9" was `os._exit`, so no cleanup ran.
+  - `PATH` had no Slurm tools.
+
+  The checks:
+  - `4ac188c` (resume):
+    - No restart: iterations 0, 1, 2 with 5 + 1 + 1 runs, and `iteration.json` empty at the
+      end.
+    - Killed in iteration 0 with 2 runs in flight and 3 points not launched: the restart adopts
+      the 2 runs, logs the resume, and runs exactly the 3 saved points as iteration 0, numbered
+      past every folder. Total 5 + 1 + 1, run numbers with no gaps.
+    - Killed before the first launch: all 5 points resumed.
+    - Killed inside a launch, before the file is rewritten: that point runs twice (the
+      documented window).
+    - Killed in a 1-point iteration: nothing to resume, and the driver goes on to the next.
+    - Unreadable, stale-iteration or wrong-parameter files: a warning, no extra runs, and a
+      normal stop at `max_iterations`.
+  - `9dae4d3` (stalled runs), with the real `GPOptimizer` (`initial_sample_count` 4, run 1
+    stalled):
+    - Run 1 is in the evaluations file with status `stalled` and its score.
+    - Neither of the 2 GP fits included it (4 and 5 rows).
+    - Iterations 0–3 had 4 + 1 + 1 + 1 runs, so the stalled run still counted towards the
+      initial sample.
+    - 1 usable of 5 rows (2 stalled, 2 crashed) gives the new "fewer than 2" error.
+  - `6931ecd` (equal scores):
+    - Every run scoring 1.0: before the change, inference-tools' "array must not contain infs or
+      NaNs"; after, the new message in `mesa.log` and the evaluations file intact.
+    - Equal usable scores with a different stalled one: still the error.
+    - Two different scores: the fit works.
+  - `1c1da0f` (`max_iterations`): the docstring reads back.
+  - `c8b5799` (cosmetics):
+    - Ctrl-C mid-iteration: exit status 130, no traceback, the short message on the screen and
+      in `mesa.log`, the heartbeat `stopped` / `interrupted`. A restart finishes the case.
+    - Ctrl-C with the heartbeat taken by another driver: "not marked stopped (see above)".
+    - The refusal message names 2 x `poll_interval` in seconds (3600 s for 1800).
+    - The new-parameter log lines print plain numbers (`np.float64(...)` before).
+    - The earlier tests rerun and pass.
 
 ### What the cluster tests must check
 
@@ -466,6 +569,15 @@ Gathered from all series; none of this could be tested here.
   recorded; restart: each is adopted, followed to the end and recorded with its iteration, new
   run numbers don't clash, and a never-submitted folder is logged and skipped. Kill it again
   during a continuation's resubmit only if the D4 window above is worth checking.
+- **Iteration number after a restart (`4ac188c`):** after a driver restart (Ctrl-C, and kill
+  -9 or a closed session), the iteration number and remaining budget are as expected:
+  - an interrupted multi-run iteration (e.g. the initial batch) carries on under its own number
+    ("Resuming iteration N" in `mesa.log`, its leftover points from `iteration.json`);
+  - a finished one is followed by the next number;
+  - the run counts per iteration in the evaluations file match a run with no restart.
+- **Stalled runs (`9dae4d3`):** a stalled run shows in the evaluations file (status `stalled`,
+  with its score) but not in the GP fit. The fit logs no row count, so check this offline: the
+  rows the GP fits are those with a score and a status other than `stalled`.
 - **Tools at start-up (C5):** the driver starts in a shell with SOLPS-ITER's `setup.csh` sourced
   and stops with the list of missing tools otherwise.
 
