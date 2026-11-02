@@ -1,6 +1,6 @@
 # Handoff: mesa-solps
 
-## Current state: driver fixes, series A, B, C and D done
+## Current state: driver fixes, series A, B, C and D done, plus three fixes from the cluster checks
 
 Fixes to the SOLPS driver are being made from a commit plan kept outside this repo, as series of
 commits labelled A1, A2, ... (A: launching runs, B: polling, C: failures and results, D: logging,
@@ -8,9 +8,23 @@ heartbeat and resume). **All four series are done: A (A1–A5), B (B1–B7), C (
 (D1–D4).** Each commit message's "Tested:" section is still empty: it is filled in after the tests
 on the cluster.
 
+After series D, three more mesa-solps commits fix problems found in the first cluster checks (not
+in the plan; see the last three rows of "Commits"): the run's starting state when the reference has
+no `b2fstate`, a convergence window counted in `b2time.nc` points, and `b2mndr_stim` in each
+run's `b2mn.dat`. The convergence settings changed names:
+
+| Setting | Default | Floor | Meaning |
+|---------|---------|-------|---------|
+| `convergence_window_points` | 25 | 5 | the fit uses the last this many points of `b2time.nc`; must be an `int` |
+| `convergence_min_run_factor` | 3 | 2 | no convergence before ceil(factor × window) points |
+| `convergence_timescale` | 1.0 s | – | unchanged |
+
+`convergence_window` and `convergence_min_run_time` are gone (passing them is a `TypeError`).
+
 **Next:** push the mesa branch, then move the mesa pin in `pyproject.toml` to its last commit (the
 last commit of the plan), then the cluster tests (see "What the cluster tests must check" below),
-then fill in the "Tested:" sections.
+then fill in the "Tested:" sections. Before the main mesa test, decide when logging starts (see
+"Open questions": start-up warnings and errors don't reach `mesa.log`).
 
 Branches (local, not pushed):
 
@@ -47,7 +61,7 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | A5    | mesa-solps | `be2b995` | `build_solps_case` copy list: adds `b2.user.parameters`, drops `fort.1` and `fort.13` (no `fort.*` files are copied from the reference). |
 | B1    | mesa-solps | `96ce9b8` | `status()` matches the job ID exactly: `squeue -h -u <user> -o %i`, parsed into a set (was a substring search of the whole table). |
 | B2    | mesa-solps | `5d8390f` | The 24 h run timeout is removed: no `"timed-out"` from `status()`, no `timeout_hours` in `Solps`, `SolpsRun` or `example_input.py`. Run length is left to SOLPS's own clean stop in `b2mn.dat`. |
-| B3    | mesa-solps | `55508cc` | `Solps` settings `convergence_min_run_time` (1e-3 s), `convergence_window` (2e-4 s), `convergence_timescale` (1.0 s), passed via each `SolpsRun` to `check_convergence`. Window ≥ minimum run time is a `ValueError` at start-up (in `Solps.__init__`), replacing the assert. |
+| B3    | mesa-solps | `55508cc` | `Solps` settings `convergence_min_run_time` (1e-3 s), `convergence_window` (2e-4 s), `convergence_timescale` (1.0 s), passed via each `SolpsRun` to `check_convergence`. Window ≥ minimum run time is a `ValueError` at start-up (in `Solps.__init__`), replacing the assert. The two times were later replaced by point counts (`2b70784`). |
 | B4    | mesa-solps | `ee6a4d4` | Per-run Slurm states. One `squeue -h -u <user> -o "%i %T %r"` call per status check; a failing call keeps the run "running". PENDING: no checks, needs-attention log after 24 h. RUNNING: convergence test (`.quit`), needs-attention log after 1 h with no `b2time.nc`. COMPLETING: wait, log after 30 min. Other states: wait. Not listed: `sacct -j <id> -n -X -o State%30`; a finished state means ended, anything else or a failing `sacct` means still running, unknown to both for 3 polls is logged. Ended: no `balance.nc`, or `b2fstate_OK_bool` (run in `run_N/`) non-zero, means crashed; else complete. State changes are logged, and `started` / `ended` are added to the job's entry in `run_info.json`. Needs-attention lines are logged once per state. |
 | B5    | mesa-solps | `27d4b18` | At the end of a healthy job: converged → complete; `b2time.nc` missing or unreadable → crashed (`check_convergence` returns `None` for "can't judge"); not converged → continued in `run_N/` (`b2fstati` → `b2fstati<k>`, `b2fstate` → `b2fstati`, `balance.nc` → `balance<k>.nc`, `b2mn.prt` removed, resubmitted, job appended to `run_info.json`). After `max_continuations` (new `Solps` setting, default 10, counted from `run_info.json`) the run is logged as stalled and returned as complete. `submit_job()` is shared by `launch()` and continuations. `SolpsRun`'s hash no longer includes the job ID. |
 | B6    | mesa | `2c5d1ba` | `launch_iteration`: each pass checks statuses, then fills free slots, then sleeps `poll_interval` (new setting, default 1800 s; no sleep after the iteration's last run). `poll_interval` is a `Mesa` argument and an optional input-file variable (`parse_input_module` only requires fields without a default). |
@@ -62,6 +76,9 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | –     | mesa-solps | `1465b36` | `SolpsRun.job_id`: read-only property returning `run_id`, so the heartbeat shows the current Slurm job. |
 | D3    | mesa | `a1a81f8` | Optional hooks `Simulation.existing_run_numbers()` and `Simulation.adopt()` (defaults: empty set / `None`), optional `SimulationRun.iteration`. At start-up every folder number with no evaluation row is adopted and polled with the normal handling until recorded, each with its own iteration, before new points are proposed; one that can't be adopted (`None`, an error, no iteration) is logged as needing attention and skipped. Per-run handling moved unchanged into `__check_run`, used by both loops. Next run number = max(rows, folders) + 1. |
 | D4    | mesa-solps | `76cedec` | `Solps.existing_run_numbers()`: the N of every `run_N/` folder. `Solps.adopt()`: no `run_info.json` → `None`; else a `SolpsRun` with run number, iteration, parameters and the last job, its Slurm state starting as last recorded (RUNNING since `started` if started and not ended, else PENDING since its submit time). `SolpsRun` takes `iteration`; the submit command is worked out once in `Solps.__init__`. |
+| –     | mesa-solps | `5d89426` | `build_solps_case` copies the reference's `b2fstate` to `run_N/b2fstati`, else its `b2fstati` (new helper `reference_state_file()`), and logs which one. Neither: an error naming the folder at start-up (in `Solps.__init__`, after `check_tools()`). |
+| –     | mesa-solps | `2b70784` | Convergence window counted in `b2time.nc` points (one saved time each, written every `b2mndr_b2time` iterations), replacing B3's times: `convergence_window_points` (25, floor 5, `int` only, else `TypeError`) and `convergence_min_run_factor` (3, floor 2; minimum run = ceil(factor × window) points); `convergence_timescale` unchanged. A value below its floor is raised to it with one warning at start-up (replaces B3's `ValueError`). `check_convergence`: fewer points than the minimum → not converged; else fit the last `window_points` points against `timesa`; `timesa` not strictly increasing in the window → warning, test still applied. Points counted over the whole file. `example_input.py` passes the three settings at their defaults. |
+| –     | mesa-solps | `1ef403c` | `b2mndr_stim` in `b2mn.dat`: `build_solps_case` sets it to `'0'` (new `b2time.nc`, time from 0), `continue_run` to `'-1'` before resubmitting (appends). New helper `set_b2mn_value()`: sets one key, keeps the rest of the file byte for byte, adds the key at the end if it is missing. |
 
 ### Changes from the plan
 
@@ -172,6 +189,17 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   submit>" and the "no `b2time.nc` for 1 h" timer restarts at adoption. `SolpsRun` takes a
   required `iteration`. The submit command moved unchanged into `Solps.__init__` so continuations
   of adopted runs use the same one.
+- **Added mesa-solps commits after series D** (not in the plan), from the first cluster checks:
+  - `5d89426` (b2fstati fallback): the start-up error is a `FileNotFoundError` (`check_tools` raises
+    `RuntimeError`).
+  - `2b70784` (window in points): the minimum is `ceil(round(factor × window, 6))`, so that e.g.
+    2.2 × 5 gives 11 and not 12 (floating point). Decided in review: `convergence_window_points`
+    must be an `int` (numpy ints are accepted; floats, even 25.0, strings and `bool` are a
+    `TypeError` at start-up); the three settings were added to `example_input.py`, which had none
+    since B3. The floors are module constants (`min_window_points`, `min_run_factor`).
+  - `1ef403c` (`b2mndr_stim`): a reference with no `b2mn.dat` still gives a run with none (as
+    before); `continue_run` raises if `run_N/b2mn.dat` is missing. Lines that don't start with the
+    quoted key (e.g. comments) are left alone.
 - Commit messages: where the plan names the cluster, the name was dropped ("checked on scratch
   runs", C3's disk sizes), and plan labels are not referenced in commit messages.
 
@@ -243,6 +271,23 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   the attribute itself to `job_id` would be clearer, left out as an unrelated refactor.
 - **mesa commit:** the required `iteration` argument breaks existing plug-ins once (see above);
   to raise in the mesa PR.
+- **Convergence floor warnings only reach the screen.** They are logged in `Solps.__init__`, which
+  runs before `Mesa.run()` sets up `mesa.log` (as for D1's start-up errors): with no handler yet,
+  Python's last-resort handler prints them to stderr, and the records are not kept for the file
+  handler added later. Left as is for now (decided). **Before the main mesa test, decide when
+  logging should start**, so that everything from start-up reaches `mesa.log`: e.g. mesa sets up
+  logging when `Mesa(...)` is built rather than in `run()`, or input files set it up (or build
+  `Mesa`) before the simulation. That would be a mesa change; it would also cover D1's start-up
+  errors. A mesa-solps-only alternative (`Solps` logging the warnings again on the first
+  `launch()`) was considered and not taken.
+- **Convergence window in points:** with a tiny time step, 25 points cover very little simulated
+  time, so a run can look converged over a short stretch. Check the defaults against real
+  `b2mndr_b2time` values and time steps.
+- **Stale `b2time.nc` in `b2mn.exe.dir/`:** `find_time_file` reads `run_N/b2mn.exe.dir/b2time.nc`
+  before `run_N/b2time.nc`. If a continuation leaves an old copy there, the point count and the
+  fit use the wrong file (see the cluster checks).
+- **`b2mn.dat` comments:** `set_b2mn_value` was only tested on hand-made files; check that real
+  `b2mn.dat` files have no other way of writing a key or a comment.
 
 ### What was tested
 
@@ -359,6 +404,27 @@ Throwaway test scripts were kept outside the repo.
 - Reruns after each D commit: earlier tests fail only where an earlier change was intended (C2's
   status column and scoring-failure rows, C5's tool check, old `SolpsRun` signatures) or where a
   test counted log lines or `read_hdf` calls that D1/D3 changed; checked against the commit before.
+- `5d89426` (b2fstati fallback): with placeholder tools on a restricted `PATH`, a reference with
+  both files, `b2fstate` only and `b2fstati` only gives `run_0/b2fstati` from the right file, with
+  the log line; with neither, `Solps(...)` raises naming the folder and nothing is created.
+- `2b70784` (window in points): synthetic `b2time.nc` files (`timesa`, `ne3da`, `te3da`): fewer
+  points than the minimum (74 of 75, not converged); exactly the minimum (converged when flat);
+  drifting (0.2 s timescale, not converged) and slow (2 s, converged) profiles; drift only before
+  the window (converged) and a jump inside it (not converged); uneven (geometric) spacing fitted
+  against `timesa`; 1 ns steps (a 5/s drift still caught); `timesa` going backwards or repeating in
+  the window (one warning, test still applied) and backwards only before it (no warning); the
+  `b2mn.exe.dir` copy still read first; a missing file gives `None`. `Solps`: defaults (25, 75,
+  1.0, no warning); floors raised with one warning each (window 3 → 5, factor 1 → 2, both at
+  once); values at the floors give no warning; 2.2 × 5 → 11, 2.5 × 7 → 18; 25.0, 25.7, `"25"`,
+  `True`, `None` rejected, `numpy.int64(30)` accepted; the old names rejected. `example_input.py`
+  compiles and its `Solps(...)` keywords are all valid (not run).
+- `1ef403c` (`b2mndr_stim`): a copy of a `b2mn.dat` with stim `-1` (tab-indented, trailing comment,
+  a commented-out stim line and a `b2mndr_stim_x` key): `'0'` after `build_solps_case`, other
+  lines byte-identical, reference unchanged; `'-1'` after `continue_run` (fake `itmsubmit`, run in
+  `run_0`), file byte-identical to the reference's, and after a second continuation; key missing
+  (with and without a final newline, only commented out, via `build_solps_case`) → added at the
+  end; CRLF endings kept; an unquoted value replaced; no `b2mn.dat` in the reference → none made.
+  The earlier two fixes' tests rerun and pass.
 - Imports of all `mesa_solps` modules, with mesa from the `mesa-ab` branch.
 
 ### What the cluster tests must check
@@ -376,6 +442,12 @@ Gathered from all series; none of this could be tested here.
   directory; whether the 24 h / 1 h / 30 min attention limits suit.
 - **Convergence and continuation (B3, B5, C4):** `.quit` is touched and SOLPS stops cleanly; a
   continuation restarts from `b2fstati` and appends to `b2time.nc`; the cap gives `"stalled"`.
+- **`b2time.nc` history (`1ef403c`, `2b70784`):** a fresh `run_N`'s `b2time.nc` starts at time 0
+  (`b2mndr_stim` `0`), and each continuation appends to it (`-1`). A continuation's `b2time.nc`
+  ends up in `run_N/`, and no stale copy stays in `run_N/b2mn.exe.dir/` (`find_time_file` reads
+  that one first). Check the point counts the driver works with against the file, and whether the
+  window and minimum defaults suit real `b2mndr_b2time` values.
+- **Reference state (`5d89426`):** the log says which reference file `b2fstati` came from.
 - **Crashes (B4, C2, C4):** a crashed run gets a row with its status and the sacct state in the
   log, keeps its folder, and the other runs carry on; watch whether the GP re-proposes crashed
   points (crash loop).
