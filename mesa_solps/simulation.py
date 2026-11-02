@@ -8,8 +8,10 @@ from time import time
 import logging
 import subprocess
 import shutil as sh
+from math import ceil
+from numbers import Integral
 from scipy.io import netcdf
-from numpy import log, polyfit, searchsorted
+from numpy import diff, log, polyfit
 
 from sims.interface import SolpsInterface
 from mesa.simulations import RunStatus, Simulation, SimulationRun
@@ -29,6 +31,11 @@ pending_attention_hours = 24.0  # PENDING
 no_time_file_attention_hours = 1.0  # RUNNING without a b2time.nc
 completing_attention_hours = 0.5  # COMPLETING
 unknown_attention_polls = 3  # polls in a row unknown to both squeue and sacct
+
+# Lowest values allowed for the convergence settings (Solps); lower ones are
+# raised to these, with a warning
+min_window_points = 5  # convergence_window_points
+min_run_factor = 2  # convergence_min_run_factor
 
 # Outside tools the driver calls, checked at start-up (in Solps.__init__)
 required_tools = (
@@ -315,8 +322,8 @@ class Solps(Simulation):
         transport_profile_bounds: tuple[float, float],
         n_proc: int = 1,
         memory_gb: int = 20,
-        convergence_min_run_time: float = 1e-3,
-        convergence_window: float = 2e-4,
+        convergence_window_points: int = 25,
+        convergence_min_run_factor: float = 3,
         convergence_timescale: float = 1.0,
         max_continuations: int = 10,
     ):
@@ -340,15 +347,36 @@ class Solps(Simulation):
             "itmsubmit" if n_proc == 1 else f'itmsubmit -m "-np {n_proc}" -M {memory_gb}GB'
         )
 
-        # convergence test (check_convergence), all in seconds of simulated time
-        if not convergence_window < convergence_min_run_time:
-            raise ValueError(
-                f"convergence_window ({convergence_window} s) must be shorter "
-                f"than convergence_min_run_time ({convergence_min_run_time} s)"
+        # convergence test (check_convergence): the window and the minimum run
+        # are numbers of points in b2time.nc, the timescale is in seconds
+        if isinstance(convergence_window_points, bool) or not isinstance(
+            convergence_window_points, Integral
+        ):
+            raise TypeError(
+                f"convergence_window_points must be a whole number of points "
+                f"(an int), got {convergence_window_points!r}"
             )
+        convergence_window_points = int(convergence_window_points)
+        if convergence_window_points < min_window_points:
+            logging.warning(
+                f"[solps_interface] convergence_window_points "
+                f"{convergence_window_points} is below the minimum; using "
+                f"{min_window_points}"
+            )
+            convergence_window_points = min_window_points
+        if convergence_min_run_factor < min_run_factor:
+            logging.warning(
+                f"[solps_interface] convergence_min_run_factor "
+                f"{convergence_min_run_factor} is below the minimum; using "
+                f"{min_run_factor}"
+            )
+            convergence_min_run_factor = min_run_factor
         self.convergence_settings = {
-            "minimum_run_time": convergence_min_run_time,
-            "window": convergence_window,
+            "window_points": convergence_window_points,
+            # rounded first so that e.g. 2.2 x 5 gives 11, not 12
+            "minimum_points": ceil(
+                round(convergence_min_run_factor * convergence_window_points, 6)
+            ),
             "timescale": convergence_timescale,
         }
         # how many times a run that ends unconverged is continued
@@ -666,12 +694,17 @@ def find_time_file(run_directory: Path) -> Path | None:
 
 
 def check_convergence(
-    run_directory: Path, minimum_run_time: float, window: float, timescale: float
+    run_directory: Path, window_points: int, minimum_points: int, timescale: float
 ) -> bool | None:
     """
-    The run is converged if it has run for at least minimum_run_time (s of
-    simulated time) and, over the last window (s), every monitored ne and Te
+    The run is converged if b2time.nc holds at least minimum_points points
+    and, fitted over its last window_points points, every monitored ne and Te
     changes on a timescale longer than timescale (s).
+
+    A point is one saved time in b2time.nc (SOLPS saves one every
+    b2mndr_b2time iterations), so the window is a number of points, not a
+    length of simulated time: with a tiny time step it is short in time.
+    Points are counted over the whole file, which continuations append to.
 
     Returns None if it can't be judged: b2time.nc is missing or can't be
     read. While the job runs that is normal (not converged yet); once the
@@ -691,14 +724,20 @@ def check_convergence(
         logging.info(f"[solps_interface] could not read {time_file}: {error!r}")
         return None
 
-    run_time = time.max() - time.min()
-    if run_time < minimum_run_time:
+    if len(time) < minimum_points:
         return False
 
-    index = searchsorted(time, time.max() - window)
-    log_te = log(te)[index:]
-    log_ne = log(ne)[index:]
-    fit_time = time[index:]
+    # the fit uses the saved times, so uneven spacing is fine
+    fit_time = time[-window_points:]
+    log_te = log(te[-window_points:])
+    log_ne = log(ne[-window_points:])
+    if not (diff(fit_time) > 0).all():
+        # e.g. a continuation started from a stale b2fstati
+        logging.warning(
+            f"[solps_interface] timesa in {time_file} is not strictly "
+            f"increasing over the last {window_points} points; the convergence "
+            f"test is applied anyway"
+        )
 
     te_gradients = polyfit(x=fit_time, y=log_te, deg=1)[0, :]
     te_timescales = 1 / abs(te_gradients)

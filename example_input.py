@@ -37,7 +37,11 @@ simulation = Solps(
     n_proc=36,
     memory_gb=20,
     transport_profile_bounds=(-0.250, 0.240),
-    reference_directory=simulations_directory / "ref_clean"
+    reference_directory=simulations_directory / "ref_clean",
+    # convergence test, on the saved times (points) in b2time.nc
+    convergence_window_points=25,  # fit over the last 25 points (an int, at least 5)
+    convergence_min_run_factor=3,  # no convergence before 3 x 25 points (at least 2)
+    convergence_timescale=1.0,     # ne and Te must change slower than this (s)
 )
 
 
