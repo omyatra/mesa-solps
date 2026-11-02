@@ -247,6 +247,8 @@ class SolpsRun(SimulationRun):
         os.rename(d / "balance.nc", d / f"balance{k}.nc")
         if isfile(d / "b2mn.prt"):
             os.remove(d / "b2mn.prt")
+        # append to the run's b2time.nc, keeping the simulated time going
+        set_b2mn_value(d / "b2mn.dat", "b2mndr_stim", "-1")
 
         job_id, submit_time = submit_job(d, self.submit_command)
         info = read_run_info(d)
@@ -556,6 +558,10 @@ def build_solps_case(
     for input in input_files:
         if isfile(reference_directory / input):
             sh.copy(reference_directory / input, case_directory / input)
+    # a new b2time.nc, with time from 0, so the run's history (which the
+    # convergence test counts) starts clean; continuations append to it
+    if isfile(case_directory / "b2mn.dat"):
+        set_b2mn_value(case_directory / "b2mn.dat", "b2mndr_stim", "0")
 
     optional_params = {k for k in parameter_dictionary.keys()} - required_parameters
     written_params = set()
@@ -600,6 +606,27 @@ def build_solps_case(
                 \r>> but were not found in any input files with a .mesa extension.
                 """
             )
+
+
+def set_b2mn_value(b2mn_file: Path, key: str, value: str):
+    """
+    Sets key to value in a b2mn.dat ('key'  'value' per line), keeping the
+    rest of each such line and every other line unchanged. If the key is not
+    set, a line for it is added at the end.
+    """
+    with open(b2mn_file, newline="") as f:
+        text = f.read()
+    # the key's quoted name at the start of a line, then its value
+    pattern = re.compile(
+        rf"^([ \t]*'{re.escape(key)}'[ \t]+)('[^'\r\n]*'|[^\s']+)", re.MULTILINE
+    )
+    text, count = pattern.subn(lambda m: f"{m.group(1)}'{value}'", text)
+    if count == 0:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += f"'{key}'  '{value}'\n"
+    with open(b2mn_file, "w", newline="") as f:
+        f.write(text)
 
 
 def reference_state_file(reference_directory: Path) -> Path | None:
