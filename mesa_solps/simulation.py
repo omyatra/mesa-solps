@@ -11,7 +11,8 @@ import shutil as sh
 from math import ceil
 from numbers import Integral
 from scipy.io import netcdf
-from numpy import diff, log, polyfit
+from numpy import diff, einsum, log, ndarray, ones
+from numpy.lib.stride_tricks import sliding_window_view
 
 from sims.interface import SolpsInterface
 from mesa.simulations import RunStatus, Simulation, SimulationRun
@@ -725,7 +726,14 @@ def check_convergence(
 ) -> bool | None:
     """
     The run is converged if b2time.nc holds at least minimum_points points
-    and, fitted over its last window_points points, ne and Te in every real
+    and the test below has held for one whole window: it passes for the
+    window of window_points points ending at each of the last
+    window_points + 1 points (so over the last 2 x window_points points).
+    Any failing window means not converged; as the test is worked out from
+    the file each time, a failure "restarts" the hold without any state
+    being kept, whenever and however often it is called.
+
+    The test on one window: fitted over its points, ne and Te in every real
     outer-midplane cell (ne3da and te3da without their two guard cells)
     change on a timescale longer than timescale (s).
 
@@ -733,6 +741,8 @@ def check_convergence(
     b2mndr_b2time iterations), so the window is a number of points, not a
     length of simulated time: with a tiny time step it is short in time.
     Points are counted over the whole file, which continuations append to.
+    A file shorter than 2 x window_points points is not converged, whatever
+    minimum_points is.
 
     Returns None if it can't be judged: b2time.nc is missing or can't be
     read. While the job runs that is normal (not converged yet); once the
@@ -756,27 +766,54 @@ def check_convergence(
         logging.info(f"[solps_interface] could not read {time_file}: {error!r}")
         return None
 
-    if len(time) < minimum_points:
+    # the test must have held for one whole window: it is applied to the
+    # window ending at each of the last window_points + 1 points, which
+    # span the last 2 x window_points points
+    hold_points = 2 * window_points
+    if len(time) < max(minimum_points, hold_points):
         return False
 
-    # the fit uses the saved times, so uneven spacing is fine
-    fit_time = time[-window_points:]
-    log_te = log(te[-window_points:])
-    log_ne = log(ne[-window_points:])
-    if not (diff(fit_time) > 0).all():
+    hold_time = time[-hold_points:]
+    if not (diff(hold_time) > 0).all():
         # e.g. a continuation started from a stale b2fstati
         logging.warning(
             f"[solps_interface] timesa in {time_file} is not strictly "
-            f"increasing over the last {window_points} points; the convergence "
+            f"increasing over the last {hold_points} points; the convergence "
             f"test is applied anyway"
         )
 
-    te_gradients = polyfit(x=fit_time, y=log_te, deg=1)[0, :]
-    te_timescales = 1 / abs(te_gradients)
+    passed = windows_pass(
+        hold_time, ne[-hold_points:], te[-hold_points:], window_points, timescale
+    )
+    return bool(passed.all())
 
-    ne_gradients = polyfit(x=fit_time, y=log_ne, deg=1)[0, :]
-    ne_timescales = 1 / abs(ne_gradients)
 
+def windows_pass(
+    time: ndarray, ne: ndarray, te: ndarray, window_points: int, timescale: float
+) -> ndarray:
+    """
+    The convergence test on every window of window_points consecutive points:
+    for each window (the first ending at point window_points - 1, the last at
+    the last point), whether a straight-line fit of log ne and log Te against
+    time gives a timescale (1 / |slope|) longer than timescale (s) in every
+    column.
 
-    converged = (te_timescales > timescale).all() and (ne_timescales > timescale).all()
-    return bool(converged)
+    time has shape (n,), ne and Te (n, columns); returns a bool array of
+    length n - window_points + 1. The fit uses the given times, so uneven
+    spacing is fine.
+    """
+    # each window's times, centred on the window's mean, so that the
+    # least-squares slope is sum(t * y) / sum(t * t)
+    window_times = sliding_window_view(time, window_points)
+    window_times = window_times - window_times.mean(axis=1, keepdims=True)
+    sum_tt = (window_times * window_times).sum(axis=1)
+
+    passed = ones(len(window_times), dtype=bool)
+    for profile in (ne, te):
+        # (windows, columns, points)
+        window_values = sliding_window_view(log(profile), window_points, axis=0)
+        slopes = einsum("wp,wcp->wc", window_times, window_values) / sum_tt[:, None]
+        # 1 / |slope| > timescale, without dividing by a zero slope; a NaN
+        # (e.g. from a non-positive value) fails
+        passed &= (abs(slopes) * timescale < 1).all(axis=1)
+    return passed
