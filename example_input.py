@@ -41,7 +41,7 @@ simulation = Solps(
     # convergence test, on the saved times (points) in b2time.nc
     convergence_window_points=100,  # fit over the last 100 points (an int, at least 5)
     convergence_min_run_factor=3,   # no convergence before 3 x 100 points (at least 2)
-    convergence_timescale=1.0,      # ne and Te must change slower than this (s)
+    convergence_timescale=1.0,      # ne and Te (real outer-midplane cells, no guard cells) must change slower than this (s)
 )
 
 

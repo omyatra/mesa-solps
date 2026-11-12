@@ -725,8 +725,9 @@ def check_convergence(
 ) -> bool | None:
     """
     The run is converged if b2time.nc holds at least minimum_points points
-    and, fitted over its last window_points points, every monitored ne and Te
-    changes on a timescale longer than timescale (s).
+    and, fitted over its last window_points points, ne and Te in every real
+    outer-midplane cell (ne3da and te3da without their two guard cells)
+    change on a timescale longer than timescale (s).
 
     A point is one saved time in b2time.nc (SOLPS saves one every
     b2mndr_b2time iterations), so the window is a number of points, not a
@@ -743,8 +744,12 @@ def check_convergence(
 
     try:
         with netcdf.netcdf_file(time_file, "r") as solps:
-            ne = solps.variables["ne3da"].data.copy()
-            te = solps.variables["te3da"].data.copy() / 1.602e-19
+            # ne3da and te3da are (time, nya): the outer-midplane column
+            # iy = -1 ... ny, so the first and last entries are the guard
+            # cells, which hold boundary values rather than plasma; only the
+            # real cells in between are tested
+            ne = solps.variables["ne3da"].data[:, 1:-1].copy()
+            te = solps.variables["te3da"].data[:, 1:-1].copy() / 1.602e-19
             time = solps.variables["timesa"].data.copy()
     except Exception as error:
         # e.g. the file is read while SOLPS is writing it; try again next poll
