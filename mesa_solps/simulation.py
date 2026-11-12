@@ -324,7 +324,7 @@ class Solps(Simulation):
         transport_profile_bounds: tuple[float, float],
         n_proc: int = 1,
         memory_gb: int = 20,
-        convergence_window_points: int = 25,
+        convergence_window_points: int = 100,
         convergence_min_run_factor: float = 3,
         convergence_timescale: float = 1.0,
         max_continuations: int = 10,
