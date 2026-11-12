@@ -1,6 +1,6 @@
 # Handoff: mesa-solps
 
-## Current state: driver fixes, series A, B, C and D done, plus fixes from the cluster checks and a dry run
+## Current state: driver fixes, series A, B, C and D done, plus fixes from the cluster checks and a dry run, and convergence check 1
 
 Fixes to the SOLPS driver are being made from a commit plan kept outside this repo, as series of
 commits labelled A1, A2, ... (A: launching runs, B: polling, C: failures and results, D: logging,
@@ -15,7 +15,7 @@ run's `b2mn.dat`. The convergence settings changed names:
 
 | Setting | Default | Floor | Meaning |
 |---------|---------|-------|---------|
-| `convergence_window_points` | 25 | 5 | the fit uses the last this many points of `b2time.nc`; must be an `int` |
+| `convergence_window_points` | 100 (was 25) | 5 | each fit uses this many points of `b2time.nc`; the test must hold for one whole window more (see "Convergence check 1"); must be an `int` |
 | `convergence_min_run_factor` | 3 | 2 | no convergence before ceil(factor × window) points |
 | `convergence_timescale` | 1.0 s | – | unchanged |
 
@@ -38,6 +38,17 @@ One more mesa commit (`6d6c8cd`, last row of "Commits") fixes the initial-sample
 `GPOptimizer`: it counted the highest run number, which starts at 0, so after N initial runs one
 more random run was drawn and iteration 1 was a 1-run random top-up. It now counts the rows of the
 evaluations data, so iteration 1 is the first GP proposal.
+
+Then convergence "check 1" (agreed on 2026-11-11) replaced the test in `check_convergence`, in three
+mesa-solps commits plus a test file (rows `7641b59` to `317d9ab` of "Commits"):
+
+- the window is 100 points by default (was 25);
+- the two guard cells of `ne3da` / `te3da` are left out (38 real cells for the MAST-U grid);
+- the test must have held for one whole window.
+
+The threshold (1 s), the floors, `convergence_min_run_factor` and check 2 (Δscore) are unchanged.
+The sanity check on real runs, timings and the solps-babysitter follow-up are in
+"Convergence check 1" below.
 
 **Next:** push the mesa branch, then the cluster tests with mesa installed from the `mesa-ab`
 branch (see below and "What the cluster tests must check"), then fill in the "Tested:" sections.
@@ -68,6 +79,80 @@ editable install after installing mesa-solps:
 pip install -e .                  # mesa-solps
 pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned mesa
 ```
+
+### Convergence check 1
+
+What the test is now (`check_convergence`, `mesa_solps/simulation.py`):
+
+- **Window:** `convergence_window_points` defaults to 100 points (was 25). The name, the `int`
+  check, the floor (5), `convergence_min_run_factor` (3, floor 2) and the 1 s timescale are
+  unchanged, so the default minimum run is 300 points.
+- **Guard cells:** `ne3da` and `te3da` are `(time, nya)`, with `nya` = ny + 2 = 40 here: the
+  outer-midplane column from iy = −1 to iy = ny. Checked on a real file before coding: `dsa` (the
+  outer-midplane radial coordinate) steps by half a cell from column 0 to 1 (5.2 mm against 9.8 mm
+  next) and from 38 to 39 (2.2 mm against 4.4 mm), so columns 0 and 39 sit on the boundary faces;
+  `dsa` changes sign between columns 20 and 21, matching `jsep` with the guard cell first. Only
+  columns 1 to 38 are fitted.
+- **Hold:** the run is converged only if the test passes for the window of `window_points` points
+  ending at each of the last `window_points + 1` points, i.e. over the last 2 × `window_points`
+  points. Any failing window means not converged, and the hold starts again after it. Nothing is
+  stored: the verdict is worked out from `b2time.nc` on every call, so it doesn't depend on when or
+  how often the driver polls, or on a restart. A file shorter than 2 × `window_points` is not
+  converged whatever `minimum_points` is (with the floors the minimum run already covers it). The
+  "`timesa` not strictly increasing" warning is now checked over those 2 × `window_points` points.
+- **Fits:** the windows are fitted together by a new module-level `windows_pass(time, ne, te,
+  window_points, timescale)`, one bool per window; its slopes are the same least-squares slopes as
+  `numpy.polyfit` (checked window by window on real files and in the tests).
+
+**Sanity check on real runs** (read-only copies of the run folders; the old check is 25 points, all
+40 columns, a single fit, minimum 75 points; the new one is 100 points, 38 columns, the hold,
+minimum 300 points; 1 s threshold for both; the saved-time step is 2e-4 s in all four, so 100
+points are 0.02 s of simulated time). "First" means the shortest prefix of the file on which the
+check passes, i.e. when a driver polling every point would have stopped the run:
+
+| Run | Points (simulated time) | Old verdict | New verdict | Old check first passes | New check first holds |
+|-----|-------------------------|-------------|-------------|------------------------|-----------------------|
+| `version_step` (D + C) | 609 (2.386–2.507 s, continued from an earlier state) | converged | converged | point 75 (0.015 s in) | point 300 (t = 2.445 s, 0.059 s in) |
+| `Donly_5b/run_0` | 2259 (0–0.450 s) | not converged | not converged | never | never |
+| `Donly_5b/run_1` | 2115 (0–0.421 s) | not converged | converged | point 1696 (t = 0.338 s) | point 1645 (t = 0.328 s) |
+| `Donly_5b/run_2` | 2259 (0–0.450 s) | not converged | converged | never | point 1633 (t = 0.325 s) |
+
+- The old 25-point fits are dominated by point-to-point noise: on the 5b runs no 25-point window
+  passes (0 %) except one in `run_1` (point 1696, and it fails again at the end of the file); on
+  `version_step` 76 % pass, so the old verdict flips from poll to poll. With 100 points, 19 %
+  (`run_0`), 28 % (`run_1`), 32 % (`run_2`) and 100 % (`version_step`) of windows pass.
+- Leaving out the guard cells changed no verdict on these four files (the pass fractions with and
+  without them agree to 0.01); it guards against boundary values the fit shouldn't see.
+- `run_0`: 46 of the last 101 windows pass; the slowest real cell in the last window has
+  τ(ne) = 1.29 s and τ(Te) = 2.39 s, so it is close but keeps failing.
+- `run_1`: once it holds (point 1645) it stays converged to the end of the file; at that point
+  the slowest τ is 1.12 s (Te) and it grows to 1.8 s by the end.
+- `run_2`: it holds at point 1633 (slowest τ(Te) 1.11 s) for only 9 points, fails again over
+  points 1642–1768 and 1797–1905, holds briefly over 1769–1796 and holds from point 1906
+  (t = 0.380 s) to the end. A driver stops the run at the first hold (`.quit`), so it would stop
+  `run_2` at 0.325 s, where it was only just under the threshold (see "Open questions").
+- `timesa` is strictly increasing in all four files.
+
+**Timing:** one `check_convergence` call on a full-length file (57–102 MB, 609–2259 points) takes
+11–16 ms for the first call in a process and 6–9 ms for later ones, with the file in the page cache.
+Reading a file that isn't cached (e.g. over a network file system) was not measured; it is
+dominated by reading `ne3da` / `te3da`, which are record variables spread through the whole file.
+
+**solps-babysitter follow-up** (not changed from here). It calls `check_convergence` through
+`solps_babysitter/mesa_link.py` with the same keyword arguments (`window_points`,
+`minimum_points`, `timescale`), so it gets the guard cells and the hold with no change. What it
+will need:
+
+- Its input files (`example_input.py`, `example_power_ramp.py`) set
+  `convergence_window_points = 25` explicitly; set 100 to match the driver's new default (with 25
+  the hold spans only 50 points and the noisy 25-point fits rarely pass).
+- `diagnostics.py` (`timescales`) has its own copy of the fit: all 40 columns and only the last
+  window. Its reported timescales will now disagree with the verdict. It should leave out
+  columns 0 and −1, and report the hold (e.g. how many of the last `window_points + 1` windows
+  pass, or since which point the test has held), e.g. by calling `windows_pass` through
+  `mesa_link.py`.
+- A run needs 2 × `window_points` points before it can pass at all; its "minimum" display, if
+  any, should use max(`minimum_points`, 2 × `window_points`).
 
 ### Commits
 
@@ -106,6 +191,10 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
 | –     | mesa | `1c1da0f` | Docstring on `Mesa.__init__`: `max_iterations` is the last iteration number to run; iterations count from 0 (iteration 0 is the initial random batch with `GPOptimizer`), so up to `max_iterations + 1` are run. No code change. |
 | –     | mesa | `c8b5799` | Ctrl-C: `run()` catches `KeyboardInterrupt`, marks the heartbeat stopped as before, logs "interrupted (Ctrl-C), heartbeat marked stopped; runs in flight not cancelled" (or "not marked stopped (see above)") and exits with `SystemExit(130)`, no traceback. The "another driver may be running" refusal adds "or wait 2 x poll_interval (N s) after the last-seen time and restart". New-parameter log lines in `core.py` and `gpo.py` print plain numbers, not `np.float64(...)`. |
 | –     | mesa | `6d6c8cd` | `GPOptimizer.propose_evaluations` counts the runs so far as the number of rows in the evaluations data (was the highest run number, one less than the count since run numbers start at 0). Every run still counts towards the initial sample (complete, stalled, crashed, timed-out, adopted). With `initial_sample_count=N`, iteration 0 has N random runs and iteration 1 is a GP proposal (was a 1-run random top-up). A run folder that can't be adopted has no row and is no longer counted. |
+| –     | mesa-solps | `7641b59` | Convergence check 1, window: `convergence_window_points` defaults to 100 (was 25); floors and `convergence_min_run_factor` unchanged, so the default minimum run is 300 points. `example_input.py` passes 100. |
+| –     | mesa-solps | `d9c467a` | Convergence check 1, guard cells: `check_convergence` fits only columns 1 to `nya` − 2 of `ne3da` / `te3da` (38 real outer-midplane cells here), not the two guard cells. |
+| –     | mesa-solps | `82e81be` | Convergence check 1, hold: converged only if the test passes for the window ending at each of the last `window_points + 1` points (over the last 2 × `window_points` points), worked out from the file on each call with no stored state; a shorter file is not converged. New `windows_pass()` fits every window at once (same slopes as `polyfit`). |
+| –     | mesa-solps | `317d9ab` | `tests/test_convergence.py`: pytest tests on small synthetic `b2time.nc` files (steady, drifting, too short, passes then fails, passes only in the last window, hold restarting, wild guard cells, `windows_pass` against `polyfit`). |
 
 ### Changes from the plan
 
@@ -351,9 +440,19 @@ pip install -e <mesa checkout>    # mesa on branch mesa-ab, replaces the pinned 
   `Mesa`) before the simulation. That would be a mesa change; it would also cover D1's start-up
   errors. A mesa-solps-only alternative (`Solps` logging the warnings again on the first
   `launch()`) was considered and not taken.
-- **Convergence window in points:** with a tiny time step, 25 points cover very little simulated
-  time, so a run can look converged over a short stretch. Check the defaults against real
-  `b2mndr_b2time` values and time steps.
+- **Convergence window in points:** with a tiny time step, the window covers very little simulated
+  time, so a run can look converged over a short stretch. Check 1 widened it to 100 points plus a
+  100-point hold; with the 2e-4 s step of the real runs checked that is 0.02 s per window and 0.04 s
+  for the hold, against a 1 s threshold. Check the defaults against other `b2mndr_b2time` values
+  and time steps.
+- **Check 1, the hold looks back only:** a run is stopped at the first point where the test has
+  held for one window, which can be right at the threshold. `run_2` of the sanity check holds at
+  point 1633 with its slowest τ(Te) at 1.11 s and then fails again for most of the next 270 points.
+  Whether that matters depends on how much the score moves in that time (check 2, Δscore, is
+  the other guard). Not changed: the threshold and the decision stand as agreed.
+- **Check 1, tests need pytest,** which is not a dependency of the package (no test extra in
+  `pyproject.toml`; adding one is a packaging change for upstream to decide). Run them with
+  `pip install pytest` and `python -m pytest tests`.
 - **Stale `b2time.nc` in `b2mn.exe.dir/`:** `find_time_file` reads `run_N/b2mn.exe.dir/b2time.nc`
   before `run_N/b2time.nc`. If a continuation leaves an old copy there, the point count and the
   fit use the wrong file (see the cluster checks).
@@ -489,6 +588,18 @@ Throwaway test scripts were kept outside the repo.
   once); values at the floors give no warning; 2.2 × 5 → 11, 2.5 × 7 → 18; 25.0, 25.7, `"25"`,
   `True`, `None` rejected, `numpy.int64(30)` accepted; the old names rejected. `example_input.py`
   compiles and its `Solps(...)` keywords are all valid (not run).
+- Convergence check 1 (`7641b59` to `317d9ab`): `tests/test_convergence.py`, 14 tests, all pass. A
+  steady run converges; a drift on a 0.5 s timescale doesn't, a 2 s one does; a missing file gives
+  `None`; 299 of 300 points and 199 of 200 (the hold, with a lower minimum) are not converged;
+  a 5 % step in the last 30 points, or 120 points from the end (the last window alone passes),
+  is not converged; after a step at point 300 it is not converged with 150 more points and
+  converged with 201 more; the verdict is the same on repeated calls; guard cells jumping by six
+  orders of magnitude, with zeros and negative values, change neither a converged nor a drifting
+  verdict; `windows_pass` agrees with `numpy.polyfit` window by window (uneven spacing, four
+  timescales). Run against the code before the guard-cell and hold commits, the hold, guard-cell
+  and `windows_pass` tests fail (6 of 14), as they should. On the real files, `windows_pass`
+  matched `polyfit` on every 37th window at three timescales (0 mismatches). The sanity check and
+  timings are in "Convergence check 1".
 - `1ef403c` (`b2mndr_stim`): a copy of a `b2mn.dat` with stim `-1` (tab-indented, trailing comment,
   a commented-out stim line and a `b2mndr_stim_x` key): `'0'` after `build_solps_case`, other
   lines byte-identical, reference unchanged; `'-1'` after `continue_run` (fake `itmsubmit`, run in
@@ -569,6 +680,10 @@ Gathered from all series; none of this could be tested here.
   ends up in `run_N/`, and no stale copy stays in `run_N/b2mn.exe.dir/` (`find_time_file` reads
   that one first). Check the point counts the driver works with against the file, and whether the
   window and minimum defaults suit real `b2mndr_b2time` values.
+- **Convergence check 1:** a run is only stopped (`.quit`) after the test has held for one window
+  (by default 300 points minimum, 200 for the hold); check in `mesa.log` / `run_info.json` that
+  converged runs stop where the offline check says, and how long a call takes on the cluster's
+  file system.
 - **Reference state (`5d89426`):** the log says which reference file `b2fstati` came from.
 - **Crashes (B4, C2, C4):** a crashed run gets a row with its status and the sacct state in the
   log, keeps its folder, and the other runs carry on; watch whether the GP re-proposes crashed
