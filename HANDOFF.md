@@ -50,6 +50,10 @@ The threshold (1 s), the floors, `convergence_min_run_factor` and check 2 (Δsco
 The sanity check on real runs, timings and the solps-babysitter follow-up are in
 "Convergence check 1" below.
 
+Synthetic Thomson-scattering data for step 7a (a known-answer test) was made from the converged
+D-only reference state with two new scripts in `tools/` and a test file; see "Synthetic TS data
+for step 7a".
+
 **Next:** push the mesa branch, then the cluster tests with mesa installed from the `mesa-ab`
 branch (see below and "What the cluster tests must check"), then fill in the "Tested:" sections.
 The mesa pin in `pyproject.toml` stays where it is until full testing is done; only then does it
@@ -154,6 +158,64 @@ will need:
 - A run needs 2 × `window_points` points before it can pass at all; its "minimum" display, if
   any, should use max(`minimum_points`, 2 × `window_points`).
 
+### Synthetic TS data for step 7a
+
+Thomson-scattering data made from a known SOLPS state, so step 7a can test whether MESA finds
+it. New files only (no existing code changed):
+
+- `tools/make_synthetic_ts.py`: builds sim-solps's `ThomsonScattering` (the model MESA scores
+  with) on a `balance.nc` with the R, z and weights of the TS instrument file, takes the true ne
+  and Te per channel from `predictions()`, warns about NaN channels (outside the mesh), sets the
+  errors to a flat fraction of the true value (default 5 %, as in the old test data) and adds
+  Gaussian noise with a fixed seed (default 0; `default_rng(seed)`, Te noise then ne noise).
+  It writes `<name>.npz` (noisy), `<name>_truth.npz` (noise-free, same errors), both with
+  `te_data`, `te_err`, `ne_data`, `ne_err`, and `<name>.json` (source path, its mtime,
+  instrument file, error fraction, seed, NaN channels, git commit). It refuses to overwrite
+  without `--overwrite`. Options: `--balance`, `--instrument`, `--out-dir`, `--name` (default
+  `synthetic_ts_refconv`), `--error-fraction`, `--seed`.
+- `tools/check_synthetic_ts.py`: the checks below, and the plot.
+- `tests/test_make_synthetic_ts.py`: errors, seeded noise (and its documented draw order), the
+  noise's distribution, NaN channels, a bad error fraction, writing and reading back, refusing to
+  overwrite, loading into `ThomsonScattering(measurements=...)`. No `balance.nc` needed.
+
+**Made from:** the converged D-only MAST-U reference state (`refconv/balance.nc`; D⊥ = 4,
+χe = χi = 10 inside the separatrix and 4 outside), with the instrument file
+`testing_ts_instrument_data.npz` (23 channels × 11 samples), at commit `3c4f29b`. Output
+(kept outside the repo): `synthetic_ts_refconv.npz`, `synthetic_ts_refconv_truth.npz`,
+`synthetic_ts_refconv.json`, `comparison.png`. Run time about 4 s.
+
+**Checks** (`tools/check_synthetic_ts.py`):
+
+- **NaN channels: none.** All 23 channels have > 95 % of their weight inside the mesh, so all
+  are predicted: 46 points (23 ne + 23 Te).
+- Both files load through `ThomsonScattering(measurements=...)` (the check MESA does), and the
+  truth file equals a fresh `predictions()` to 1e-12.
+- **Scores** with the likelihood `SolpsLikelihood` uses: `cauchy_likelihood` from
+  `sims.likelihoods`, −Σ log(1 + z²) with z = (data − prediction) / error, summed over ne and
+  Te. Scored by calling `SolpsLikelihood.evaluate` on the state itself:
+
+  | Data | `cauchy_logprob` | Gaussian χ² |
+  |------|------------------|-------------|
+  | truth | 0.000 | 0.00 |
+  | noisy (seed 0) | −19.081 | 31.40 |
+  | old test data | −0.041 | 0.04 |
+
+  The truth score is 0, the best possible (each term is ≤ 0). For 46 points with Gaussian noise
+  the Cauchy score has mean −24.55, sd 3.51 and a 95 % range of [−31.71, −17.93] (Monte Carlo,
+  200 000 draws). −19.08 is inside it, at the 94.5th percentile: seed 0 happens to give
+  slightly small residuals (χ² = 31.4 against 46 ± 9.6, 1.5 sd low). It is in the range
+  expected.
+- **Plot** (`comparison.png`): ne and Te against R (channel-weighted mean of the sample points):
+  truth line, noisy points with error bars, old test data. The noisy points scatter about the
+  truth within their errors.
+
+**Copying the data to the cluster:** copy the two `.npz` files and the `.json` (the plot is
+optional) to wherever the 7a input file reads its TS data, e.g.
+`scp <output folder>/synthetic_ts_refconv*.{npz,json} <cluster>:<data folder>/`, and check
+them with `sha256sum` at both ends. In the 7a input file, load
+`synthetic_ts_refconv.npz` (or `_truth.npz` for a noise-free test) as the `measurements` of
+`ThomsonScattering`, with the same instrument file as here.
+
 ### Commits
 
 | Label | Repo | Commit | What it does |
@@ -195,6 +257,9 @@ will need:
 | –     | mesa-solps | `d9c467a` | Convergence check 1, guard cells: `check_convergence` fits only columns 1 to `nya` − 2 of `ne3da` / `te3da` (38 real outer-midplane cells here), not the two guard cells. |
 | –     | mesa-solps | `82e81be` | Convergence check 1, hold: converged only if the test passes for the window ending at each of the last `window_points + 1` points (over the last 2 × `window_points` points), worked out from the file on each call with no stored state; a shorter file is not converged. New `windows_pass()` fits every window at once (same slopes as `polyfit`). |
 | –     | mesa-solps | `317d9ab` | `tests/test_convergence.py`: pytest tests on small synthetic `b2time.nc` files (steady, drifting, too short, passes then fails, passes only in the last window, hold restarting, wild guard cells, `windows_pass` against `polyfit`). |
+| –     | mesa-solps | `3c4f29b` | `tools/make_synthetic_ts.py`: synthetic TS data from a `balance.nc` (see "Synthetic TS data for step 7a"). |
+| –     | mesa-solps | `be41e15` | `tools/check_synthetic_ts.py`: reload, truth check, scores and plot for the synthetic data. |
+| –     | mesa-solps | `3c94574` | `tests/test_make_synthetic_ts.py`: tests for the noise, errors and file writing. |
 
 ### Changes from the plan
 
@@ -458,6 +523,23 @@ will need:
   fit use the wrong file (see the cluster checks).
 - **`b2mn.dat` comments:** `set_b2mn_value` was only tested on hand-made files; check that real
   `b2mn.dat` files have no other way of writing a key or a comment.
+- **Synthetic TS, the old test data is already near this truth.** `testing_ts_data.npz` scores
+  −0.041 against the refconv state: it has no noise and is within 0.5 % (ne) and 0.07 % (Te) of
+  the new truth, i.e. it looks like noise-free synthetic data from a state very close to this
+  one. Where did it come from? If it came from the same transport, earlier tests with it were
+  already known-answer tests.
+- **Synthetic TS, which file for 7a:** the noisy file is the realistic test; the truth file is a
+  cleaner first test (the score at the right answer is exactly 0). Seed 0 gives a slightly
+  low-residual draw (94.5th percentile); fine, or pick another seed.
+- **Synthetic TS, the answer MESA should find:** with the noisy data the best-scoring
+  transport is not exactly the true one (the noise moves the optimum), so 7a should check that
+  the true D⊥ and χ values fall within MESA's spread, not that they are hit exactly. The
+  parameters MESA fits must also be able to express the true profiles (a step at the
+  separatrix: 10 inside, 4 outside for χ; flat 4 for D⊥).
+- **Synthetic TS, flat errors:** 5 % of the true value at every channel, as in the old test
+  data. Real TS errors are larger at low density (the far SOL); not modelled.
+- **Synthetic TS tools in the repo:** `tools/` holds analysis scripts for this fit and may not
+  belong upstream; keep them in their own commits so they are easy to leave out of a PR.
 
 ### What was tested
 
