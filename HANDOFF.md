@@ -54,6 +54,11 @@ Synthetic Thomson-scattering data for step 7a (a known-answer test) was made fro
 D-only reference state with two new scripts in `tools/` and a test file; see "Synthetic TS data
 for step 7a".
 
+A step transport profile (`Solps(profile_shape="step")`) was added for step 7, so the fit can use
+the earlier step fit's 4-parameter setup, with tests and a draft input file
+`example_input_step7.py`; see "Step transport profile for step 7". It is on its own branch,
+`worktree-step-profile`, based on `worktree-mesa-ab`.
+
 **Next:** push the mesa branch, then the cluster tests with mesa installed from the `mesa-ab`
 branch (see below and "What the cluster tests must check"), then fill in the "Tested:" sections.
 The mesa pin in `pyproject.toml` stays where it is until full testing is done; only then does it
@@ -64,6 +69,8 @@ test, decide when logging starts (see "Open questions": start-up warnings and er
 Branches (local, not pushed):
 
 - mesa-solps: `worktree-mesa-ab`
+- mesa-solps: `worktree-step-profile` (`worktree-mesa-ab` plus the step profile, its tests, the
+  draft step-7 input file and this HANDOFF update)
 - mesa: `mesa-ab` (14 commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3, then five
   from the dry run, then the initial-sample count fix)
 
@@ -216,6 +223,123 @@ them with `sha256sum` at both ends. In the 7a input file, load
 `synthetic_ts_refconv.npz` (or `_truth.npz` for a noise-free test) as the `measurements` of
 `ThomsonScattering`, with the same instrument file as here.
 
+### Step transport profile for step 7
+
+Step 7 fits the synthetic TS data above with the setup of an earlier step fit (made with a
+modified copy of upstream mesa-solps): a step transport profile, one core value and one SOL value
+per coefficient with the jump at the separatrix ±1 mm, and 4 free parameters
+(`chi_boundary_left/right`, `D_boundary_left/right`, each in (0.05, 100)). The true transport
+(D⊥ = 4; χ = 10 inside, 4 outside) is a step, so it can be reached.
+
+**How the earlier fit makes its step.** Its `models.py` differs from ours only in
+`profile_radius_axis`, which returns the fixed knots `[left, -0.001, +0.001, right]` and ignores
+the parameters (the knot-spacing code is commented out). Its `simulation.py` profile code is
+the same as ours: `linear_transport_profile` (the barrier profile, unchanged) is evaluated at
+those 4 knots. Its input file fixes the other 14 parameters so that the barrier collapses to a
+step: `frac_left/right` 1, `barrier_centre` 0, `barrier_height` 0.1, `barrier_width` 0,
+`gap_left/right` 1e-6. Then at −0.25 and −0.001 the profile is the left asymptote
+`boundary_left + barrier_height` (with frac 1 the left slope is 0), and at +0.001 and +0.24 it is
+`boundary_right + barrier_height`. So each written value is the boundary parameter + 0.1, e.g.
+run 0: `D_boundary_left` 32.805427 → 32.905427. The χe (kind 3) and χi (kind 4) profiles are
+the same χ profile.
+
+**Why our fork broke with those parameters.** Our `profile_radius_axis` places 6 points around
+each of the barrier's 4 inner knots, spaced by the distance to the neighbouring knot. With width
+0 and gaps 1e-6 the 4 knots are within 2 µm of each other, so 24 of the 32 points print (6
+decimals) as −0.000001, 0.000000 or 0.000001, with different values at the same printed
+position, and the value at 0.000000 is the barrier level 0.1. Checked on run 0's parameters.
+
+**What changed** (commit `9424724`):
+
+- `Solps(profile_shape=...)`: `"barrier"` (default, the existing profile) or `"step"`.
+- `models.step_profile_knots(params, boundaries)`: knots `[left, -0.001, +0.001, right]`
+  (`step_half_width` = 0.001 m) and values `[core, core, sol, sol]` with
+  core = `boundary_left + barrier_height` and sol = `boundary_right + barrier_height`, which is
+  what the earlier fit's barrier profile gives at those knots with its fixed settings.
+  `params` is `(boundary_left, boundary_right, barrier_height)` (`parameters.step_conductivity_profile`
+  and `step_diffusivity_profile`). The other 7 parameters per profile are not used and need not be
+  in the input file.
+- `simulation.transport_profiles(parameters, profile_shape, bounds)`: returns
+  `(D_radius, D, chi_radius, chi)`; the barrier branch is the old code from `Solps.launch()`,
+  moved unchanged, and `launch()` calls it at the same point as before (after the run folder is
+  made). It can be called without `Solps` (whose start-up needs the Slurm tools).
+- `check_profile_shape()` at start-up (in `Solps.__init__`, before `check_tools()`): an unknown
+  shape, or step bounds that don't satisfy left < −0.001 and right > 0.001, is a `ValueError`.
+  For `"barrier"` nothing is checked (as before). A missing step parameter is a `KeyError` naming
+  it, raised in `launch()`.
+- `write_solps_transport_inputfile` and `build_solps_case` are unchanged. The step parameters are
+  all in `required_parameters`, so they are not treated as `.mesa` template parameters.
+
+**Mapping, earlier fit → ours:**
+
+| Earlier fit | Ours (`profile_shape="step"`) |
+|-------------|-------------------------------|
+| knots `[left, -0.001, 0.001, right]` from the hard-coded `profile_radius_axis` | `step_profile_knots`, same knots |
+| values: `linear_transport_profile` at the knots, with frac 1, centre 0, width 0, gap 1e-6 | `boundary_left/right + barrier_height`, directly |
+| 18 parameters in the input file (14 fixed) | 6 needed: the 4 boundaries and the 2 barrier heights; the rest ignored |
+| `set_div_transport`, `no_pflux=.true.` written by the writer | taken from `ref_clean/b2.transport.inputfile` (our template writer) |
+
+The values agree whenever frac is 1 (the earlier fit's settings). With other frac or gap values the
+earlier code would give a value between the asymptote and the barrier level at ±0.001; ours always
+gives the asymptote.
+
+**Tests** (`tests/test_step_profile.py`, commit `3b4fbe0`; `pip install pytest`, then
+`python -m pytest tests`): 46 passed, 3 skipped (the optional reference-data checks), with the
+two older test files included; 0.5 s. With `MESA_STEP_REFERENCE_DATA` set to the folder holding
+the earlier fit's `evaluations_data.h5` and `b2.transport.inputfile_{0,1,9}`, those 3 pass too
+(needs `tables`).
+
+- **Reproduction of runs 0, 1 and 9: byte-identical** to the earlier fit's files (the same knots,
+  values and formatting, down to the trailing space in `no_pflux=.true. `), when the template is
+  laid out as those files are (`&TRANSPORT`, the kind 1, 3 and 4 blocks, `no_pflux=.true.`, `/`).
+  This is checked twice: against the files embedded in the test (parameters from the
+  evaluations file, at full precision), and, with `MESA_STEP_REFERENCE_DATA`, against the files
+  and the evaluations file themselves (all 18 parameters as recorded). In a real run our file
+  differs from theirs only in what comes from `ref_clean/b2.transport.inputfile` (its other
+  lines, e.g. a kind 7 block, `no_pflux`), not in the fitted blocks. With the earlier fit's fixed
+  parameters, the barrier profile evaluated at the step knots equals the step values (to 1e-12).
+- **Positions:** unique and strictly increasing in every written profile, for 200 random step
+  points over (0.05, 100), the truth, the build test and the 6 barrier sets.
+- **Truth** (`D_boundary_left/right` 3.9, `chi_boundary_left` 9.9, `chi_boundary_right` 3.9,
+  barrier heights 0.1): kind 1 is 4.000000 at all 4 knots; kinds 3 and 4 are 10.000000,
+  10.000000, 4.000000, 4.000000. The template's other lines (kind 7 block, a comment,
+  `no_pflux`) are kept.
+- **Barrier path unchanged:** for the midpoints of `example_input.py`'s bounds and 5 random points
+  in them, `transport_profiles(..., "barrier", ...)` writes the same bytes as the profile code
+  copied from before the change (32 points per profile). The default of `profile_shape` is
+  `"barrier"`.
+- Errors: unknown shape (`"Step"`), step bounds not enclosing ±1 mm, a missing barrier height.
+- A fresh non-editable `pip install .` imports `mesa_solps.simulation` and `.objective`.
+
+**Build test (nothing submitted):** `test_step7_build` (also run by hand into a temporary folder)
+reads `example_input_step7.py` with `ast`, without running it, draws one initial run's free
+parameters uniformly within their bounds (as `GPOptimizer` does), adds the fixed ones, and writes
+`parameters.json` and `b2.transport.inputfile` from a template with extra lines. Seed 0 gave
+`chi_boundary_left` 63.714, `chi_boundary_right` 27.015, `D_boundary_left` 4.145,
+`D_boundary_right` 1.702: written as D 4.245304 / 1.801937 and χ 63.814321 / 27.115182 at
+−0.25, −0.001 | 0.001, 0.24, with the template's other lines unchanged. `test_step7_input_settings`
+checks the input file's settings (step shape, window 100, 12 initial runs, 12 concurrent runs,
+`max_iterations` 25, the 4 free parameters and their bounds, floats only as mesa's input check
+requires).
+
+**`example_input_step7.py` (draft, commit `8f235d9`).** As `example_input.py`, with:
+`profile_shape="step"`; the 4 free parameters in (0.05, 100.0) and `chi/D_barrier_height` fixed
+at 0.1; convergence check 1 (`convergence_window_points=100`, factor 3, timescale 1 s), no other
+stop rule; TS measurements `synthetic_ts_refconv.npz`; `initial_sample_count=12`,
+`max_concurrent_runs=12`, `max_iterations=25` (iteration 0: 12 random runs; iterations 1 to 25:
+one GP point each, so 37 runs at most, plus continuations); the GP settings of the earlier fit
+(SquaredExponential, QuadraticMean, UCB κ = 1, trust region 0.3). It still needs:
+
+- **TODO, paths:** `simulations_directory` (the case folder, holding `ref_clean/`) and
+  `ts_data_directory` (where `synthetic_ts_refconv.npz` and the instrument file were copied) are
+  placeholders, as committed files carry no machine paths. The instrument file must be the one
+  the synthetic data was made with (`testing_ts_instrument_data.npz`).
+- **TODO, starting state (separate task):** runs start from `ref_clean`'s own state; starting them
+  from the converged state is left as a comment.
+- **CHECK, marked in the file:** `n_proc` 36 and `memory_gb` 20 (from `example_input.py`);
+  `max_continuations` 10 (the default); `fit_stalled=False` (the default); `poll_interval` not
+  set (1800 s default); the barrier heights 0.1 (see the open questions).
+
 ### Commits
 
 | Label | Repo | Commit | What it does |
@@ -260,6 +384,9 @@ them with `sha256sum` at both ends. In the 7a input file, load
 | –     | mesa-solps | `3c4f29b` | `tools/make_synthetic_ts.py`: synthetic TS data from a `balance.nc` (see "Synthetic TS data for step 7a"). |
 | –     | mesa-solps | `be41e15` | `tools/check_synthetic_ts.py`: reload, truth check, scores and plot for the synthetic data. |
 | –     | mesa-solps | `3c94574` | `tests/test_make_synthetic_ts.py`: tests for the noise, errors and file writing. |
+| –     | mesa-solps | `9424724` | Step transport profile: `Solps(profile_shape="step")`, `models.step_profile_knots`, `simulation.transport_profiles` and `check_profile_shape` (see "Step transport profile for step 7"). Default `"barrier"` unchanged. Branch `worktree-step-profile`. |
+| –     | mesa-solps | `8f235d9` | `example_input_step7.py`: draft input file for step 7 (step profile, 4 free parameters). |
+| –     | mesa-solps | `3b4fbe0` | `tests/test_step_profile.py`: reproduction of the earlier step fit's files, positions, truth, unchanged barrier path, build test for `example_input_step7.py`. |
 
 ### Changes from the plan
 
@@ -538,6 +665,31 @@ them with `sha256sum` at both ends. In the 7a input file, load
   separatrix: 10 inside, 4 outside for χ; flat 4 for D⊥).
 - **Synthetic TS, flat errors:** 5 % of the true value at every channel, as in the old test
   data. Real TS errors are larger at low density (the far SOL); not modelled.
+- **Step profile, barrier heights in step 7:** the draft fixes `chi/D_barrier_height` at 0.1, as
+  the earlier fit did, so values run from 0.15 to 100.1 and the truth is at boundaries 3.9 / 9.9.
+  Fixing them at 0.0 would make the boundary parameters the coefficients themselves (truth at 4 /
+  10, values 0.05 to 100). 0.1 keeps the runs comparable with the earlier fit's; decide before
+  step 7.
+- **Step profile, linear or log bounds:** (0.05, 100) is drawn and fitted on a linear scale, so
+  the initial 12 runs put few points near the truth (D 4 is in the bottom 4 % of the range; the
+  chance that all 4 parameters fall below 10 is 10⁻⁴). Same as the earlier fit; a narrower range or
+  a log-scale parameter would be a separate change.
+- **Step profile, jump width fixed:** ±1 mm (`step_half_width`) is a module constant, as in the
+  earlier fit. If it should be a setting, that is a small follow-up.
+- **Step profile, missing parameter leaves a run folder:** a step parameter missing from the
+  input file raises a `KeyError` in `launch()` after `build_solps_case` has made `run_N/` (the
+  barrier path behaves the same for its parameters). Computing the profiles before
+  `build_solps_case` would avoid it; left out to keep `launch()`'s order unchanged.
+- **Barrier path, no position check:** the barrier shape can still write repeated or
+  non-increasing positions when its knots nearly coincide (e.g. the earlier fit's parameters with
+  `"barrier"`). The step shape can't. Adding a check (error if positions repeat) to the barrier
+  path or the writer would change the default path, so it was left out; worth deciding.
+- **Earlier fit, other differences not carried over:** its writer writes the whole file
+  (`&TRANSPORT`, `no_pflux=.true.`, optional kind 7 and `no_div`) instead of using
+  `ref_clean`'s file as a template, and its `Solps` has `set_div_transport` and `timeout_hours`.
+  Ours takes all of that from `ref_clean/b2.transport.inputfile` (A2) and has no timeout (B2).
+  Check that `ref_clean`'s file has `no_pflux=.true.` and no viscosity block, as the earlier
+  fit's runs had.
 - **Synthetic TS tools in the repo:** `tools/` holds analysis scripts for this fit and may not
   belong upstream; keep them in their own commits so they are easy to leave out of a PR.
 
