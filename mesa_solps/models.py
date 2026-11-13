@@ -189,3 +189,38 @@ def smooth_profile_knots(
     knots = array(knots)
     knots.sort()
     return knots
+
+
+# half-width (m) of the jump at the separatrix in a step profile: the core value
+# holds up to -step_half_width, the SOL value from +step_half_width
+step_half_width = 0.001
+
+
+def step_profile_knots(
+    params: Sequence[float], boundaries: tuple[float, float]
+) -> tuple[ndarray, ndarray]:
+    """
+    Knots of a step transport profile: one core value and one SOL value, with
+    the jump at the separatrix (radius 0) spread over +-step_half_width.
+
+    params is (boundary_left, boundary_right, barrier_height). As in
+    linear_transport_profile, the boundary values are heights above the
+    barrier level, so the core value is boundary_left + barrier_height and the
+    SOL value is boundary_right + barrier_height.
+
+    Returns the knot positions [left edge, -step_half_width, +step_half_width,
+    right edge] and their values.
+    """
+    boundary_left, boundary_right, barrier_height = params
+    left, right = boundaries
+    if not left < -step_half_width < step_half_width < right:
+        raise ValueError(
+            f"transport_profile_bounds {tuple(boundaries)} must enclose the step "
+            f"at +-{step_half_width} m (left < {-step_half_width}, right > "
+            f"{step_half_width})"
+        )
+    knot_locations = array([left, -step_half_width, step_half_width, right])
+    core = boundary_left + barrier_height
+    sol = boundary_right + barrier_height
+    knot_values = array([core, core, sol, sol])
+    return knot_locations, knot_values

@@ -58,3 +58,17 @@ dataframe_columns = (
     "prediction_error",
     "convergence_metric",
 )
+
+# the parameters a step profile (Solps profile_shape="step") uses, in the
+# order step_profile_knots takes them; the other profile parameters are ignored
+step_conductivity_profile = (
+    "chi_boundary_left",
+    "chi_boundary_right",
+    "chi_barrier_height",
+)
+
+step_diffusivity_profile = (
+    "D_boundary_left",
+    "D_boundary_right",
+    "D_barrier_height",
+)

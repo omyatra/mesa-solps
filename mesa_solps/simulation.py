@@ -17,8 +17,14 @@ from numpy.lib.stride_tricks import sliding_window_view
 from sims.interface import SolpsInterface
 from mesa.simulations import RunStatus, Simulation, SimulationRun
 from .transport import check_transport_template, write_solps_transport_inputfile
-from .models import linear_transport_profile, profile_radius_axis
-from .parameters import conductivity_profile, diffusivity_profile, required_parameters
+from .models import linear_transport_profile, profile_radius_axis, step_profile_knots
+from .parameters import (
+    conductivity_profile,
+    diffusivity_profile,
+    required_parameters,
+    step_conductivity_profile,
+    step_diffusivity_profile,
+)
 
 
 # Slurm job states (sacct) after which the job will not run again
@@ -42,6 +48,11 @@ min_run_factor = 2  # convergence_min_run_factor
 required_tools = (
     "setup_baserun_eirene_links", "itmsubmit", "squeue", "sacct", "b2fstate_OK_bool"
 )
+
+# Transport profile shapes (Solps profile_shape): "barrier" is the 9-parameter
+# piecewise-linear profile with a transport barrier; "step" is one core value
+# and one SOL value with the jump at the separatrix (models.step_profile_knots)
+profile_shapes = ("barrier", "step")
 
 
 class SolpsRun(SimulationRun):
@@ -329,7 +340,10 @@ class Solps(Simulation):
         convergence_min_run_factor: float = 3,
         convergence_timescale: float = 1.0,
         max_continuations: int = 10,
+        profile_shape: str = "barrier",
     ):
+        # stop now if the transport profile settings can't be used
+        check_profile_shape(profile_shape, transport_profile_bounds)
         # stop now, before any run folder is created, if a tool is missing
         check_tools()
         # absolute, so it doesn't depend on the current directory
@@ -341,6 +355,7 @@ class Solps(Simulation):
                 f"{self.reference_directory}, so runs can't be started from it"
             )
         self.transport_bounds = transport_profile_bounds
+        self.profile_shape = profile_shape
         # stop now, before anything is submitted, if the reference
         # b2.transport.inputfile can't be used as a template
         check_transport_template(self.reference_directory / "b2.transport.inputfile")
@@ -415,13 +430,9 @@ class Solps(Simulation):
         )
 
         # produce transport profiles defined by new point
-        chi_params = [parameters[k] for k in conductivity_profile]
-        chi_radius = profile_radius_axis(chi_params, self.transport_bounds)
-        chi = linear_transport_profile(chi_radius, chi_params, self.transport_bounds)
-
-        D_params = [parameters[k] for k in diffusivity_profile]
-        D_radius = profile_radius_axis(D_params, self.transport_bounds)
-        D = linear_transport_profile(D_radius, D_params, self.transport_bounds)
+        D_radius, D, chi_radius, chi = transport_profiles(
+            parameters, self.profile_shape, self.transport_bounds
+        )
 
         write_solps_transport_inputfile(
             template=self.reference_directory / 'b2.transport.inputfile',
@@ -529,6 +540,62 @@ def submit_job(run_directory: Path, command: str) -> tuple[str, float]:
     tmp = str(start_run_output).find(findstr)
     job_id = str(start_run_output)[tmp + len(findstr) + 1:-3]
     return job_id, time()
+
+
+def check_profile_shape(profile_shape: str, transport_profile_bounds: tuple[float, float]):
+    """
+    Raises an error if profile_shape is not one of profile_shapes, or if the
+    profile bounds can't hold a step profile when profile_shape is "step".
+    """
+    if profile_shape not in profile_shapes:
+        raise ValueError(
+            f"profile_shape must be one of {profile_shapes}, got {profile_shape!r}"
+        )
+    if profile_shape == "step":
+        # raises a ValueError if the bounds don't enclose the step
+        step_profile_knots((0.0, 0.0, 0.0), transport_profile_bounds)
+
+
+def transport_profiles(
+    parameters: dict[str, float],
+    profile_shape: str,
+    transport_profile_bounds: tuple[float, float],
+) -> tuple[ndarray, ndarray, ndarray, ndarray]:
+    """
+    The D and chi transport profiles for one run, as knot positions and values:
+    returns (D_radius, D, chi_radius, chi).
+
+    "barrier": the piecewise-linear barrier profile, evaluated on the radius
+    axis from profile_radius_axis; uses the 9 parameters per profile in
+    parameters.conductivity_profile and parameters.diffusivity_profile.
+    "step": 4 knots per profile from step_profile_knots; uses only the
+    parameters in parameters.step_conductivity_profile and
+    parameters.step_diffusivity_profile, and ignores the others.
+    """
+    check_profile_shape(profile_shape, transport_profile_bounds)
+    if profile_shape == "step":
+        missing = [
+            k for k in (*step_diffusivity_profile, *step_conductivity_profile)
+            if k not in parameters
+        ]
+        if missing:
+            raise KeyError(f"profile_shape 'step' needs the parameters {missing}")
+        chi_radius, chi = step_profile_knots(
+            [parameters[k] for k in step_conductivity_profile], transport_profile_bounds
+        )
+        D_radius, D = step_profile_knots(
+            [parameters[k] for k in step_diffusivity_profile], transport_profile_bounds
+        )
+        return D_radius, D, chi_radius, chi
+
+    chi_params = [parameters[k] for k in conductivity_profile]
+    chi_radius = profile_radius_axis(chi_params, transport_profile_bounds)
+    chi = linear_transport_profile(chi_radius, chi_params, transport_profile_bounds)
+
+    D_params = [parameters[k] for k in diffusivity_profile]
+    D_radius = profile_radius_axis(D_params, transport_profile_bounds)
+    D = linear_transport_profile(D_radius, D_params, transport_profile_bounds)
+    return D_radius, D, chi_radius, chi
 
 
 def build_solps_case(
