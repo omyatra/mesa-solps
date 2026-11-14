@@ -59,6 +59,11 @@ the earlier step fit's 4-parameter setup, with tests and a draft input file
 `example_input_step7.py`; see "Step transport profile for step 7". It is on its own branch,
 `worktree-step-profile`, based on `worktree-mesa-ab`.
 
+New runs now continue in time from the reference state (`b2mndr_stim` `'-1'` in new runs too,
+decided 2026-11-14; was `'0'`, time from 0), on branch `fresh-run-stim-continue`; see "Time" in
+"Step 7 launch on Gateway". Before the launch, `baserun/` must hold no `b2time.nc` or other
+appended B2 output (check in "Launch").
+
 **Next:** push the mesa branch, then the cluster tests with mesa installed from the `mesa-ab`
 branch (see below and "What the cluster tests must check"), then fill in the "Tested:" sections.
 The mesa pin in `pyproject.toml` stays where it is until full testing is done; only then does it
@@ -71,6 +76,8 @@ Branches (local, not pushed):
 - mesa-solps: `worktree-mesa-ab`
 - mesa-solps: `worktree-step-profile` (`worktree-mesa-ab` plus the step profile, its tests, the
   draft step-7 input file and this HANDOFF update)
+- mesa-solps: `fresh-run-stim-continue` (from `worktree-mesa-ab` at `edc996d`: new runs continue
+  in time from the reference state, and this HANDOFF update)
 - mesa: `mesa-ab` (14 commits: one needed by A4, then B6, B7, C1, C2, D1, D2 and D3, then five
   from the dry run, then the initial-sample count fix)
 
@@ -354,17 +361,48 @@ the source and may be off by a few lines in the version on the cluster:
 - **Files needed:** only `b2fstati` (plus `baserun/` and the `fort.1` link made by
   `setup_baserun_eirene_links`). `b2mn` depends on `b2mn.dat b2fgmtry b2fpardf b2fstati
   b2frates fort.30 AMJUEL` (`runs/Makefile:192`), no `fort.*` restart file and no `b2time.nc`.
-  `b2time.nc` is only read back to append to it when `b2mndr_stim` < 0
-  (`B2.5/src/user/b2mod_wrsrt.F:241`); a new run has `'0'` (`simulation.py:629-632`), so it
-  starts a new file. EIRENE reads `fort.15` only for a census start (`NFILEJ` 2 or 3,
+  `b2time.nc` is only read back to append to it when `b2mndr_stim` < 0 and an existing file is
+  found (`B2.5/src/modules/b2mod_mwti.F90:347-371`); if none is found, B2 creates one ("b2time.nc
+  will be created", `:350-357`), whatever stim is. A new run has `'-1'` (`simulation.py:629-637`)
+  but no `b2time.nc` in its folder, so it starts a new file. Where B2 looks: it runs in
+  `run_N/b2mn.exe.dir/`, which the Makefile deletes and makes again at the start of each job
+  (`runs/Makefile:196`, `:242`), and `find_file` (`B2.5/src/utility/open_file.F:193-230`) tries
+  `./`, then `../` (= `run_N/`), `../baserun/` (= `run_N/baserun/`, normally absent) and
+  `../../baserun/` (= the case folder's shared `baserun/`). The path found is the one B2 then
+  writes to (`filename` is saved, `b2mod_mwti.F90:186`, and reopened for each write, `:1448`). So a
+  continuation appends to `run_N/b2time.nc` in place, and a new run's file is made in
+  `b2mn.exe.dir/` and moved to `run_N/` at the end of the job (`runs/Makefile:278`). **If the
+  shared `baserun/` holds a `b2time.nc`, every new run appends to that one file instead** (and
+  no `run_N/b2time.nc` appears, so the driver logs "needs attention" after 1 h and calls the run
+  crashed when the job ends). The other files B2 appends to when stim < 0 follow the same
+  pattern (create if not found, append to the one found): `b2tallies.nc`
+  (`B2.5/src/output/tallies.F:586-614`), `b2wall.nc` (`B2.5/src/sources/b2stbr.F:1155-1163`),
+  `b2batch.nc` (`b2mod_mwti.F90:398-410`), `b2movies.nc` and `eirenemovies.nc`
+  (`B2.5/src/user/cdfmovie.F:75-80`, `:261-266`), and the `tracing/*.trc` files
+  (`B2.5/src/user/b2mod_file.F:94-98`, `b2mod_usrtrc.F:1798-1806`, `b2mod_wrsrt.F:232-241` and the
+  other `b2mod_bln*.F`, `b2mod_wrint.F`, `b2mod_wrsep.F`, `b2mod_usrspb.F`); see the check before
+  the launch below. `balance.nc` is always written new (`nf_create` with `NF_CLOBBER`,
+  `B2.5/src/modules/b2mod_balance.F:2844`); `read_balance` is only called from the IMAS output
+  code (`B2.5/src/ids/b2mod_ual_io.F90:1052`). EIRENE doesn't read `b2mndr_stim`. EIRENE reads `fort.15` only for a census start (`NFILEJ` 2 or 3,
   `Eirene/src/startup-routines/setup_time_surface.f:118-122`), skips Monte Carlo and reads
   saved tallies only for `NFILEN` 2 or 7 (`main-routines/eirmod_mcarlo.F:337`), and writes
   `fort.13` if it is missing (`startup-routines/input.F:857-863`). Not checked here: that
   `ref_clean/input.dat` uses none of these (block 1, `NFILEJ` and `NFILEN` below 2).
-- **Time:** `b2mndr_stim` `'0'` sets the simulated time to 0, overriding the time stored in
-  `b2fstati` (`B2.5/src/driver/b2mod_driver.F:991-996`, `:2319-2322`). The plasma state is
-  refconv's, but the time printed and saved in `b2time.nc` starts from 0, not from refconv's
-  end time. This keeps each run's `b2time.nc` history clean for the convergence test.
+- **Time:** a new run continues in time from the reference state (decided 2026-11-14; until
+  then a new run had `b2mndr_stim` `'0'`, which reset the time to 0). With `'-1'`, B2 keeps the
+  time stored in `b2fstati` (`B2.5/src/driver/b2mod_driver.F:991-996`, `:2319-2329`), so the
+  time printed and saved in `b2time.nc` carries on from refconv's end time, in new runs and
+  continuations alike. Each run's `b2time.nc` history still starts with the run (a new file, see
+  above), and the convergence test fits against `timesa`, so the start time doesn't matter to it
+  (`version_step` in "Convergence check 1" started at 2.386 s). What else sees the absolute time
+  (none of it checked in `ref_clean/` here):
+  - `b2mndr_etim` must be 0 (or absent): B2 stops with "faulty input etim" unless etim is 0 or
+    later than the start time (`b2mod_driver.F:2330-2331`), and a nonzero etim is an absolute
+    end time (`:2788`). The local copies of the 5b runs and `version_step` don't set it.
+  - Time-dependent inputs are read against the absolute time, e.g. the density feedback
+    `b2mndr_ne_wanted_time` (`b2mod_driver.F:1775`, `:2481`) and `b2news_l_timbound`
+    (`B2.5/src/modules/b2mod_boundary_namelist.F:414`); if `ref_clean/` uses any, they now see
+    refconv's end time, not 0.
 - **Stopping:** at each poll, a job that Slurm lists as RUNNING gets the convergence test, and if
   it holds the driver touches `run_N/b2mn.exe.dir/.quit` (`simulation.py:137-138`,
   `:182-193`). `b2mn` checks for `.quit` after every time step (`b2mod_driver.F:2747`, `:2784`)
@@ -381,7 +419,22 @@ git pull --ff-only origin worktree-mesa-ab
 echo $status
 ```
 
-`$status` should print 0. Then, in a tcsh with SOLPS-ITER's `setup.csh` sourced (the driver needs
+`$status` should print 0. Before the launch, check the shared `baserun/` (in the case folder,
+next to where the `run_N/` folders go) and `ref_clean/b2mn.dat` (see "Files needed" and "Time"
+above):
+
+```
+cd <case folder>
+ls -d baserun/b2time.nc baserun/b2tallies.nc baserun/b2wall.nc baserun/b2batch.nc \
+      baserun/b2movies.nc baserun/eirenemovies.nc baserun/tracing
+grep etim <ref_clean>/b2mn.dat
+```
+
+`ls` must report "No such file or directory" for every one: any of them in `baserun/` would be
+appended to by every run (move it out of `baserun/`, don't copy it into `ref_clean/` either).
+`grep` must print nothing, or `b2mndr_etim` with a value of 0.
+
+Then, in a tcsh with SOLPS-ITER's `setup.csh` sourced (the driver needs
 `itmsubmit`, `squeue`, `sacct`, `setup_baserun_eirene_links` and `b2fstate_OK_bool` on `PATH`):
 
 ```
@@ -397,10 +450,14 @@ start-up errors that come before logging starts.
 
 - `mesa.log` has "run_0: b2fstati copied from the reference's b2fstate".
 - `grep -c b2ai run_0/run.log` prints 0: no `b2ai` line, so no flat start.
-- The first time printed is one time step from 0, not refconv's end time (see "Time" above); this
-  is expected. To check that the run really starts from refconv's state, compare the first point
-  of the run's `b2time.nc` with the last point of refconv's: the outer-midplane `ne3da` and `te3da`
-  should agree to within a few per cent (a flat start differs by far more).
+- `run_0/run.log` says "b2time.nc will be created" (not "appended"): a new file, not one found in
+  `baserun/`.
+- The first time printed is one time step after refconv's end time, not one step from 0 (see
+  "Time" above). In `run_0`'s `b2time.nc` (in `run_0/b2mn.exe.dir/` while the job runs, in
+  `run_0/` after it), the first `timesa` is refconv's last `timesa` plus about one time step. To
+  check that the run really starts from refconv's state, compare the first point of the run's
+  `b2time.nc` with the last point of refconv's: the outer-midplane `ne3da` and `te3da` should
+  agree to within a few per cent (a flat start differs by far more).
 
 ### Commits
 
@@ -450,6 +507,7 @@ start-up errors that come before logging starts.
 | –     | mesa-solps | `8f235d9` | `example_input_step7.py`: draft input file for step 7 (step profile, 4 free parameters). |
 | –     | mesa-solps | `3b4fbe0` | `tests/test_step_profile.py`: reproduction of the earlier step fit's files, positions, truth, unchanged barrier path, build test for `example_input_step7.py`. |
 | –     | mesa-solps | `d67dda0` | `example_input_step7.py`: paths filled in, `memory_gb` 2, settled settings, start from the converged `b2fstate` (see "Step transport profile for step 7"). |
+| –     | mesa-solps | `1ed9690` | `build_solps_case` sets `b2mndr_stim` to `'-1'` in a new run's `b2mn.dat` (was `'0'`), as `continue_run` does: the simulated time carries on from the reference's end time. The new folder has no `b2time.nc`, so B2 still starts a new one. Branch `fresh-run-stim-continue`. |
 
 ### Changes from the plan
 
@@ -571,6 +629,14 @@ start-up errors that come before logging starts.
   - `1ef403c` (`b2mndr_stim`): a reference with no `b2mn.dat` still gives a run with none (as
     before); `continue_run` raises if `run_N/b2mn.dat` is missing. Lines that don't start with the
     quoted key (e.g. comments) are left alone.
+  - `1ed9690` (new runs continue in time, decided 2026-11-14): replaces `1ef403c`'s rule "new run
+    `'0'`, continuation `'-1'`"; now both are `'-1'`, so a run's times follow on from the
+    reference state's instead of restarting at 0. The SOLPS source was read first to check that a
+    `'-1'` run with no `b2time.nc` creates one rather than failing (see "Files needed"). Found
+    while reading: B2 would append to a `b2time.nc` (and its other appended outputs) in the shared
+    `baserun/`, so a check was added to the launch steps. The earlier "Files needed" citation for
+    the `b2time.nc` append (`b2mod_wrsrt.F:241`) was the trace file `tracing/intshrt.trc`; it now
+    cites `b2mod_mwti.F90`, where `b2time.nc` is opened.
 - **Added mesa commits after series D** (not in the plan), from a dry run with fake Slurm tools.
   Each was agreed before it was written, and committed one at a time:
   - `4ac188c` (resume): of three options (save the unlaunched points; reuse the adopted runs'
@@ -905,6 +971,12 @@ Throwaway test scripts were kept outside the repo.
   end; CRLF endings kept; an unquoted value replaced; no `b2mn.dat` in the reference → none made.
   The earlier two fixes' tests rerun and pass.
 - Imports of all `mesa_solps` modules, with mesa from the `mesa-ab` branch.
+- `1ed9690` (new runs continue in time): `python -m pytest tests` with
+  `MESA_STEP_REFERENCE_DATA` set: 49 passed (no test file checks `b2mndr_stim`; `1ef403c`'s
+  checks were throwaway scripts). By hand, `build_solps_case` in a temp folder on a reference
+  `b2mn.dat` with stim `'0'` (tab, trailing comment, a commented-out stim line): `'-1'` in the
+  run's file, every other byte unchanged. The SOLPS checks are reading only (see "Files needed"
+  and "Time").
 - Dry-run commits (`4ac188c` to `c8b5799`). The setup:
   - A toy plug-in in Python that keeps each run's state in its folder, so runs survive a killed
     driver. A run is complete after 2 status checks.
@@ -972,8 +1044,10 @@ Gathered from all series; none of this could be tested here.
   directory; whether the 24 h / 1 h / 30 min attention limits suit.
 - **Convergence and continuation (B3, B5, C4):** `.quit` is touched and SOLPS stops cleanly; a
   continuation restarts from `b2fstati` and appends to `b2time.nc`; the cap gives `"stalled"`.
-- **`b2time.nc` history (`1ef403c`, `2b70784`):** a fresh `run_N`'s `b2time.nc` starts at time 0
-  (`b2mndr_stim` `0`), and each continuation appends to it (`-1`). A continuation's `b2time.nc`
+- **`b2time.nc` history (`1ef403c`, `2b70784`, `1ed9690`):** a fresh `run_N` gets a new
+  `b2time.nc` ("will be created" in `run.log`) whose first time is one step after refconv's end
+  time (`b2mndr_stim` `-1`), and each continuation appends to it (`-1`); `baserun/` holds no
+  `b2time.nc`. A continuation's `b2time.nc`
   ends up in `run_N/`, and no stale copy stays in `run_N/b2mn.exe.dir/` (`find_time_file` reads
   that one first). Check the point counts the driver works with against the file, and whether the
   window and minimum defaults suit real `b2mndr_b2time` values.
