@@ -328,17 +328,79 @@ at 0.1; convergence check 1 (`convergence_window_points=100`, factor 3, timescal
 stop rule; TS measurements `synthetic_ts_refconv.npz`; `initial_sample_count=12`,
 `max_concurrent_runs=12`, `max_iterations=25` (iteration 0: 12 random runs; iterations 1 to 25:
 one GP point each, so 37 runs at most, plus continuations); the GP settings of the earlier fit
-(SquaredExponential, QuadraticMean, UCB κ = 1, trust region 0.3). It still needs:
+(SquaredExponential, QuadraticMean, UCB κ = 1, trust region 0.3).
 
-- **TODO, paths:** `simulations_directory` (the case folder, holding `ref_clean/`) and
-  `ts_data_directory` (where `synthetic_ts_refconv.npz` and the instrument file were copied) are
-  placeholders, as committed files carry no machine paths. The instrument file must be the one
-  the synthetic data was made with (`testing_ts_instrument_data.npz`).
-- **TODO, starting state (separate task):** runs start from `ref_clean`'s own state; starting them
-  from the converged state is left as a comment.
-- **CHECK, marked in the file:** `n_proc` 36 and `memory_gb` 20 (from `example_input.py`);
-  `max_continuations` 10 (the default); `fit_stalled=False` (the default); `poll_interval` not
-  set (1800 s default); the barrier heights 0.1 (see the open questions).
+**Filled in (commit `d67dda0`):** both paths are set; `memory_gb` 2 (was 20); `n_proc` 36,
+`max_continuations` 10, `fit_stalled=False`, `poll_interval` default (1800 s) and the barrier
+heights 0.1 are settled, so the file has no CHECK or TODO left. The start state is no longer a
+separate task: `ref_clean/` holds the converged reference's final `b2fstate` (and no
+`b2fstati`), which `build_solps_case` copies to each run's `b2fstati`. `ref_clean/b2mn.dat`
+keeps `b2mndr_ntim` 100000 (decided).
+
+### Step 7 launch on Gateway
+
+**How a run starts** (read from the code; nothing run). SOLPS paths are relative to the
+SOLPS-ITER `src/` tree (`runs/Makefile`) and `src/modules/`; line numbers are from a local copy of
+the source and may be off by a few lines in the version on the cluster:
+
+- **Start state:** `build_solps_case` copies `ref_clean/b2fstate` to `run_N/b2fstati` with
+  `shutil.copy` (`mesa_solps/simulation.py:621`, file from `reference_state_file`, `:700-709`).
+  `shutil.copy` copies data and mode but not times, so the copy's mtime is the launch time. The
+  SOLPS runs `Makefile` rebuilds `b2fstati` with `b2ai` only if it is older than `b2ag.dat`,
+  `b2ai.dat` or `b2fgmtry` (`runs/Makefile:177`, found in the run folder or `baserun/` by
+  `vpath`, `:131-134`), which were copied into `baserun/` before the launch, so `b2ai` is not
+  rerun. A continuation renames `b2fstate` to `b2fstati` (`simulation.py:257`), and that
+  `b2fstate` was written by the job, so it is newer too.
+- **Files needed:** only `b2fstati` (plus `baserun/` and the `fort.1` link made by
+  `setup_baserun_eirene_links`). `b2mn` depends on `b2mn.dat b2fgmtry b2fpardf b2fstati
+  b2frates fort.30 AMJUEL` (`runs/Makefile:192`), no `fort.*` restart file and no `b2time.nc`.
+  `b2time.nc` is only read back to append to it when `b2mndr_stim` < 0
+  (`B2.5/src/user/b2mod_wrsrt.F:241`); a new run has `'0'` (`simulation.py:629-632`), so it
+  starts a new file. EIRENE reads `fort.15` only for a census start (`NFILEJ` 2 or 3,
+  `Eirene/src/startup-routines/setup_time_surface.f:118-122`), skips Monte Carlo and reads
+  saved tallies only for `NFILEN` 2 or 7 (`main-routines/eirmod_mcarlo.F:337`), and writes
+  `fort.13` if it is missing (`startup-routines/input.F:857-863`). Not checked here: that
+  `ref_clean/input.dat` uses none of these (block 1, `NFILEJ` and `NFILEN` below 2).
+- **Time:** `b2mndr_stim` `'0'` sets the simulated time to 0, overriding the time stored in
+  `b2fstati` (`B2.5/src/driver/b2mod_driver.F:991-996`, `:2319-2322`). The plasma state is
+  refconv's, but the time printed and saved in `b2time.nc` starts from 0, not from refconv's
+  end time. This keeps each run's `b2time.nc` history clean for the convergence test.
+- **Stopping:** at each poll, a job that Slurm lists as RUNNING gets the convergence test, and if
+  it holds the driver touches `run_N/b2mn.exe.dir/.quit` (`simulation.py:137-138`,
+  `:182-193`). `b2mn` checks for `.quit` after every time step (`b2mod_driver.F:2747`, `:2784`)
+  and stops cleanly, so a converged run is stopped mid-job, at most one `poll_interval` after it
+  converged. The test is run again when the job ends (`simulation.py:227`).
+
+**Launch.** In the mesa-solps checkout on Gateway (installed as before, with mesa installed
+editable from `mesa-ab`). The step 7 commits must be pushed first: they are local only.
+
+```
+git fetch origin
+git checkout worktree-mesa-ab
+git pull --ff-only origin worktree-mesa-ab
+echo $status
+```
+
+`$status` should print 0. Then, in a tcsh with SOLPS-ITER's `setup.csh` sourced (the driver needs
+`itmsubmit`, `squeue`, `sacct`, `setup_baserun_eirene_links` and `b2fstate_OK_bool` on `PATH`):
+
+```
+python -c "import mesa_solps.simulation, mesa_solps.objective"
+echo $status
+nohup python example_input_step7.py >& step7_driver.out &
+```
+
+`mesa.log` and `heartbeat.json` are written in the case folder; `step7_driver.out` gets the
+start-up errors that come before logging starts.
+
+**First job: what to check** (`run_0`, while it runs):
+
+- `mesa.log` has "run_0: b2fstati copied from the reference's b2fstate".
+- `grep -c b2ai run_0/run.log` prints 0: no `b2ai` line, so no flat start.
+- The first time printed is one time step from 0, not refconv's end time (see "Time" above); this
+  is expected. To check that the run really starts from refconv's state, compare the first point
+  of the run's `b2time.nc` with the last point of refconv's: the outer-midplane `ne3da` and `te3da`
+  should agree to within a few per cent (a flat start differs by far more).
 
 ### Commits
 
@@ -387,6 +449,7 @@ one GP point each, so 37 runs at most, plus continuations); the GP settings of t
 | –     | mesa-solps | `9424724` | Step transport profile: `Solps(profile_shape="step")`, `models.step_profile_knots`, `simulation.transport_profiles` and `check_profile_shape` (see "Step transport profile for step 7"). Default `"barrier"` unchanged. Branch `worktree-step-profile`. |
 | –     | mesa-solps | `8f235d9` | `example_input_step7.py`: draft input file for step 7 (step profile, 4 free parameters). |
 | –     | mesa-solps | `3b4fbe0` | `tests/test_step_profile.py`: reproduction of the earlier step fit's files, positions, truth, unchanged barrier path, build test for `example_input_step7.py`. |
+| –     | mesa-solps | `d67dda0` | `example_input_step7.py`: paths filled in, `memory_gb` 2, settled settings, start from the converged `b2fstate` (see "Step transport profile for step 7"). |
 
 ### Changes from the plan
 
