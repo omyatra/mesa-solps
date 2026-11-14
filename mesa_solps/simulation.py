@@ -626,10 +626,14 @@ def build_solps_case(
     for input in input_files:
         if isfile(reference_directory / input):
             sh.copy(reference_directory / input, case_directory / input)
-    # a new b2time.nc, with time from 0, so the run's history (which the
-    # convergence test counts) starts clean; continuations append to it
+    # time carries on from the time stored in b2fstati (the reference's end
+    # time), as in continuations. The new folder has no b2time.nc, so B2
+    # starts a new one, which continuations then append to. B2 also looks for
+    # an existing b2time.nc (and its other appended outputs) in the shared
+    # baserun/ folder and would append to one found there, so baserun/ must
+    # hold none.
     if isfile(case_directory / "b2mn.dat"):
-        set_b2mn_value(case_directory / "b2mn.dat", "b2mndr_stim", "0")
+        set_b2mn_value(case_directory / "b2mn.dat", "b2mndr_stim", "-1")
 
     optional_params = {k for k in parameter_dictionary.keys()} - required_parameters
     written_params = set()
